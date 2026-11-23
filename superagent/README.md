@@ -63,7 +63,7 @@ Per-project choices live in `tickets/PROJECT.md`: `Merge` (ask, auto, auto-low-r
 
 `sa queue <workspace>` prints what starts next: tickets landing, then tests and reviews, then ready tickets, `Priority: high` first, then one that has waited more than three days, then the one most others wait on, then the oldest. Every other ready ticket gets one reason (waits on a ticket, paused project).
 
-`sa sweep <workspace>` prints what was left on the side: a ticket in flight with no agent, an approval parked for hours, a ticket merged and never checked, a ready ticket that could start, old drafts, a paused project holding ready work, a finished ticket whose working copy is still there. A finding keeps the time it was first seen until it is fixed.
+`sa sweep <workspace>` prints what was left on the side: a ticket in flight with no agent, an approval parked for hours, a ticket merged and never checked, a ready ticket that could start, old drafts, a paused project holding ready work, a finished ticket whose working copy is still there, and the machine's disk when less than 25 GB is free (`--disk-gb`). A finding keeps the time it was first seen until it is fixed.
 
 The `follow-up` agent runs both every 10 minutes while the router is open, hands each new finding to the router, and removes the working copy of a finished ticket with `sa cleanup <ticket-dir>` (only when the project says `Cleanup: auto`, the ticket is `done`, its branch is merged and nothing is uncommitted; removing a working copy also deletes its ignored files, such as a local `.env`). With no router open, `superagent/sweep-timer.sh install <workspace>` keeps the two files current (`remove` undoes it); the findings then wait in `FOLLOWUP.md` for the next session.
 

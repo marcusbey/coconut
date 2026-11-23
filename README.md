@@ -78,7 +78,7 @@ a tie goes to a read-only test or a referee. Logins, payments, stops and facts o
 
 **Order and follow-up.** `sa queue` computes what starts next and gives every waiting ticket one reason.
 `sa sweep` lists what was left on the side: a ticket with no agent, an approval parked for hours, a ready ticket
-that could start, a paused project holding work, a finished working copy still on disk. A follow-up agent runs both
+that could start, a paused project holding work, a finished working copy still on disk, a disk with less than 25 GB free. It also sees a project that has tickets but was never listed. A follow-up agent runs both
 every 10 minutes and hands each new finding to the router.
 
 **Cost.** `sa stats <workspace> [hours]` shows the spend by role, model, stage and price.

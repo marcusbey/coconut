@@ -9,6 +9,7 @@ NOW="2026-11-20 12:00"
 
 D=""; WS=""
 fail() { echo "$*"; exit 1; }
+export SA_DISK_FREE_GB=500   # the machine's own free space must not decide a test
 flow() { SA_NOW="$NOW" SA_WORKTREES="$D/wt" python3 -I "$FLOW" "$@"; }
 has() { printf '%s\n' "$1" | grep -qE -- "$2" || fail "want /$2/ in: $1"; }
 hasnt() { printf '%s\n' "$1" | grep -qE -- "$2" && fail "did not want /$2/ in: $1"; return 0; }
@@ -109,6 +110,24 @@ c_paused() { # a paused project's ready ticket is "paused project", never a star
   out=$(flow queue "$WS") || fail "queue failed: $out"
   has "$(section "$out" 'Not startable')" 'off#001 demo-ticket \| ready \| paused project \|'
   hasnt "$(section "$out" 'Start next')" 'off#001'
+}
+
+c_unlisted() { # a project with a board that ACTIVE-PROJECTS.md does not name is seen, as not active, and only once
+  local out
+  mkdir -p "$WS/extra/tickets" "$WS/listed/docs/tickets"
+  printf -- '- [ ] listed\n' >> "$WS/ACTIVE-PROJECTS.md"
+  board_reset extra; ticket extra 001 lonely ready alongside -
+  board_reset listed/docs; ticket listed/docs 002 nested ready alongside -
+  out=$(flow queue "$WS") || fail "queue failed: $out"
+  has "$(section "$out" 'Not startable')" 'extra#001 lonely \| ready \| paused project \|'
+  hasnt "$(section "$out" 'Start next')" 'extra#001'
+  [ "$(printf '%s\n' "$out" | grep -c '#002 nested')" = 1 ] || fail "the listed project's board was read twice: $out"
+  has "$out" 'listed#002 nested'
+  # a working copy of an unlisted project, lying in the workspace with the same board, is not a second project
+  git -C "$WS/extra" init -q && git -C "$WS/extra" add -A && git -C "$WS/extra" -c user.name=t -c user.email=t@t commit -qm x
+  git -C "$WS/extra" worktree add -q "$WS/extra-copy" -b copy
+  out=$(flow queue "$WS") || fail "queue failed: $out"
+  [ "$(printf '%s\n' "$out" | grep -c '#001 lonely')" = 1 ] || fail "a working copy became a second project: $out"
 }
 
 c_sections() { # landing first, then test/review, then ready; decisions and drafts get their sections
@@ -227,6 +246,17 @@ c_ok() { # nothing to report: OK, and a plain run writes nothing
   has "$(cat "$WS/decision-room/FOLLOWUP.md")" 'Nothing open'
 }
 
+c_disk() { # free space under the limit is the first finding; above it there is none
+  local out
+  sed -i.bak 's/^- \[ \] off/- [x] off/' "$WS/ACTIVE-PROJECTS.md"
+  out=$(SA_DISK_FREE_GB=12 flow sweep "$WS") || fail "sweep failed: $out"
+  [ "$(printf '%s\n' "$out" | head -1)" = "NEW: disk | machine | 12 GB free, under the limit of 25 GB | since $NOW" ] || fail "want the disk finding first, got: $out"
+  out=$(SA_DISK_FREE_GB=12 flow sweep "$WS" --disk-gb 10) || fail "sweep failed: $out"
+  hasnt "$out" 'disk'
+  out=$(flow sweep "$WS") || fail "sweep failed: $out"
+  hasnt "$out" 'disk'
+}
+
 c_watchdog() { # the watchdog's problems appear as kind watchdog, and its live memory file is not used
   local out state="$D/state"
   sed -i.bak 's/^- \[ \] off/- [x] off/' "$WS/ACTIVE-PROJECTS.md"
@@ -257,11 +287,13 @@ run_case "queue: Priority high goes first" c_priority
 run_case "queue: an old startable ticket outranks a new one" c_aged
 run_case "queue: more dependents (also indirect) ranks first" c_dependents
 run_case "queue: a paused project's ticket is not startable" c_paused
+run_case "queue: an unlisted project with a board is seen once, as not active" c_unlisted
 run_case "queue: sections, landing before tests before ready" c_sections
 run_case "queue: --write makes QUEUE.md; a plain run writes nothing" c_queue_write
 run_case "sweep: stalled, parked, paused, drafts, blocked, startable, unchecked" c_sweep_kinds
 run_case "sweep: cleanup says merged and clean, or why not" c_cleanup
 run_case "sweep: KNOWN keeps first seen; a fixed finding disappears" c_known_and_gone
 run_case "sweep: OK on a clean fixture" c_ok
+run_case "sweep: low disk space is the first finding" c_disk
 run_case "sweep: watchdog problems, its live memory untouched" c_watchdog
 run_case "sweep-timer: print passes plutil -lint" c_timer

@@ -2,10 +2,10 @@
 """flow.py queue|sweep <workspace> [options]: two read-only reports over every ticked project's board.
 
 queue  one computed start list (what to start next, what waits for a decision, what cannot start, drafts).
-sweep  follow-up findings (stalled, parked, unchecked, startable, paused, drafts, blocked, cleanup, watchdog),
+sweep  follow-up findings (disk, stalled, parked, unchecked, startable, paused, drafts, blocked, cleanup, watchdog),
        each with a stable key and a first-seen time kept in <workspace>/decision-room/.followup-state.json.
 Both print; with --write they also write decision-room/QUEUE.md or FOLLOWUP.md (temp file, then os.replace).
-Tests set SA_NOW (YYYY-MM-DD HH:MM) for "now" and SA_WORKTREES for the worktrees root.
+Tests set SA_NOW (YYYY-MM-DD HH:MM) for "now", SA_WORKTREES for the worktrees root and SA_DISK_FREE_GB for the free space.
 Format details: PROTOCOL.md sections 1 to 3.
 """
 import argparse
@@ -65,13 +65,33 @@ def git(*args):
 
 # ---------------------------------------------------------------- reading the workspace
 
+def repo_id(path):
+    """The repository a folder belongs to (the same for every working copy of it), or None outside git."""
+    code, out = git("-C", path, "rev-parse", "--git-common-dir")
+    return os.path.realpath(os.path.join(path, out.strip())) if code == 0 and out.strip() else None
+
+
 def projects(ws):
-    """[(path as ticked, active)] from ACTIVE-PROJECTS.md."""
+    """[(path as ticked, active)] from ACTIVE-PROJECTS.md, then every other folder one or two levels down that
+    has a board, as not active: a project the owner started by word and never listed still leaves finished
+    working copies and waiting tickets behind."""
     found = []
     for line in read(os.path.join(ws, "ACTIVE-PROJECTS.md")).splitlines():
         m = re.match(r"^- \[([ xX])\] (\S+)", line)
         if m:
             found.append((m.group(2).rstrip("/") or ".", m.group(1) != " "))
+    listed = [p if os.path.isabs(p) else os.path.join(ws, p) for p, _ in found]
+    boards = {os.path.realpath(b) for b in map(find_board, listed) if b}
+    repos = {r for r in map(repo_id, listed) if r}
+    for base in sorted(glob.glob(os.path.join(ws, "*", "")) + glob.glob(os.path.join(ws, "*", "*", ""))):
+        rel = os.path.relpath(base, ws)
+        board = None if any(part.startswith(".") for part in rel.split(os.sep)) else find_board(base)
+        # not a second project: a listed project's docs/tickets, a second board in one repository, a working copy
+        if not board or os.path.realpath(board) in boards or repo_id(base) in repos:
+            continue
+        boards.add(os.path.realpath(board))
+        repos.add(repo_id(base) or base)
+        found.append((rel, False))
     return found
 
 
@@ -320,6 +340,17 @@ def cleanup_reason(repo, wt, base):
     return "merged and clean" if not problems else "not removable: " + ", ".join(problems)
 
 
+def disk_findings(ws, limit_gb):
+    # a full disk stops every agent at once; what fills it is the agents' own memory overflow and working copies
+    try:
+        free = float(os.environ.get("SA_DISK_FREE_GB") or shutil.disk_usage(ws).free / 2 ** 30)
+    except (OSError, ValueError):
+        return []
+    if not free < limit_gb:  # also a value that is not a number
+        return []
+    return [("disk", "machine", "%d GB free, under the limit of %g GB" % (free, limit_gb), "")]
+
+
 def watchdog_findings(ws):
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog.sh")
     state = tempfile.mkdtemp(prefix="flow-watchdog.")  # its own memory file, never the live one
@@ -382,7 +413,7 @@ def build_findings(ws, now, a):
                 idle = (now_ts - newest) / 60
                 if idle >= a.stale_min:
                     found.append(("stalled", r, "stage %s, no activity for %d min" % (t["stage"], idle), ""))
-    return found + watchdog_findings(ws)
+    return disk_findings(ws, a.disk_gb) + found + watchdog_findings(ws)
 
 
 def run_sweep(ws, now, a):
@@ -396,7 +427,7 @@ def run_sweep(ws, now, a):
         key = "|".join(x for x in (kind, r, extra) if x)
         findings.append((kind, r, what, key, seen.get(key)))
     new_state = {key: first or now.strftime(STAMP) for _, _, _, key, first in findings}
-    kinds = ["stalled", "parked", "unchecked", "startable", "paused", "drafts", "blocked", "cleanup", "watchdog"]
+    kinds = ["disk", "stalled", "parked", "unchecked", "startable", "paused", "drafts", "blocked", "cleanup", "watchdog"]
     ordered = sorted(findings, key=lambda f: (kinds.index(f[0]), new_state[f[3]], f[1]))
     if not ordered:
         lines, doc = ["OK"], ["# Follow-up, built %s" % now.strftime(STAMP), "", "Nothing open."]
@@ -422,6 +453,7 @@ def main(argv):
     ap.add_argument("--stale-min", type=float, default=30)
     ap.add_argument("--park-hours", type=float, default=4)
     ap.add_argument("--draft-days", type=float, default=7)
+    ap.add_argument("--disk-gb", type=float, default=25)
     a = ap.parse_args(argv)
     ws = os.path.realpath(a.workspace)
     if not os.path.isdir(ws):
