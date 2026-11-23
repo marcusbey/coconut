@@ -64,8 +64,8 @@ builds. Nothing merges unless the recorded test and both reviews cover exactly t
 
 | Model | Work |
 |---|---|
-| Fable 5.2 | Writing tickets, writing plans, a seat in the decision room |
-| Opus | Design, second reviews, investigations, bugs, high-risk builds |
+| Fable 5.2 | Writing tickets, writing plans, design, the Claude review of every plan and change, a seat in the decision room |
+| Opus | Investigations, bugs, high-risk builds |
 | Sonnet | Research, building, merging, checking, follow-up |
 | Haiku | Tests, small clerk jobs |
 

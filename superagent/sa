@@ -2151,9 +2151,9 @@ PERL
 # `sa run-options --table` prints it. The first row whose role and stage key match wins. Stage keys: plan (starts with
 # plan, not plan-review), scout (rd.md's header has Kind: scout or Risk: high), write, second, any, else a word the
 # stage contains. The stage is matched in lower case, because routers write it loosely.
-TIER_RULE='Tier rule of 2026-11-22: Fable 5.2 only for the decision room, ticket writing and the plan stage. A model the owner chose goes on the ticket first (a Model:, Plan model: or Review model: line, written by the clerk).'
+TIER_RULE='Tier rule of 2026-11-22: Fable 5.2 only for the decision room, ticket writing, the plan stage, the design stage and the Claude reviews. A model the owner chose goes on the ticket first (a Model:, Plan model: or Review model: line, written by the clerk).'
 TIER_ROWS='worker,teammate,reproducer|plan|fable|fable|medium|starts with `plan` (but not `plan-review` / `plan review`)
-worker,teammate,reproducer|design|opus|opus|high|`design`
+worker,teammate,reproducer|design|fable|fable|high|`design`
 reproducer|any|opus|opus|medium|anything else
 worker,teammate|scout|opus|opus|medium|ticket rd.md has `Kind: scout`, or `Risk: high`
 worker,teammate|research|sonnet|sonnet|medium|`research`
@@ -2161,7 +2161,7 @@ worker,teammate|any|sonnet|sonnet|low|anything else (build, report, unknown)
 ticket-writer|write|fable|fable|medium|`write`, `writing`, `project`, `draft`, `prd`, `spec`
 ticket-writer|any|haiku|sonnet|low|anything else (clerk jobs)
 tester|any|haiku|haiku|low|any
-codex-reviewer|second|opus|opus|medium|`second` or `claude`
+codex-reviewer|second|fable|fable|medium|`second` or `claude`
 codex-reviewer|any|sonnet|opus|medium|anything else
 decision-room|referee|opus|opus|high|`referee`
 decision-room|any|sonnet|fable|medium|anything else

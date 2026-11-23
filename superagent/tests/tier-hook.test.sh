@@ -159,11 +159,13 @@ run_case "a role that is not a superagent role passes" c_other_role_passes
 run_case "a router older than router.md is logged, never refused" c_old_router_not_refused
 run_case "a review on opus passes, whatever its brief calls it" c_review_on_opus_passes
 c_review_model_line() {
-  # the owner's Review model: line covers the Claude review only; Model: never covers a review
-  awk '{ print } /^Status:/ && !d { print "Model: fable"; d = 1 }' "$T/rd.md" > "$D/rd" && cat "$D/rd" > "$T/rd.md"
-  agent "$D/p.json" codex-reviewer "Ticket folder: $T"$'\nStage: second-review' 'tool_input.model="fable"'
-  refused "$D/p.json" 'codex-reviewer at stage "second-review" runs on opus at most (asked: fable)'
-  awk '{ print } /^Status:/ && !d { print "Review model: fable"; d = 1 }' "$T/rd.md" > "$D/rd" && cat "$D/rd" > "$T/rd.md"
+  # fable passes for the Claude reviews and a builder's design with no line; the Codex wrapper and the build stay below
+  agent "$D/p.json" codex-reviewer "Ticket folder: $T"$'\nStage: claude-review' 'tool_input.model="fable"'
+  hook "$D/p.json"; [ "$RC" = 0 ] || fail "claude-review on fable must pass: $RC"
+  agent "$D/d.json" worker "Ticket folder: $T"$'\nStage: design' 'tool_input.model="fable"' 'tool_use_id="t_d"'
+  hook "$D/d.json"; [ "$RC" = 0 ] || fail "design on fable must pass: $RC"
+  agent "$D/b.json" worker "Ticket folder: $T"$'\nStage: build' 'tool_input.model="fable"' 'tool_use_id="t_b"'
+  hook "$D/b.json"; [ "$RC" = 2 ] || fail "build on fable must be refused: $RC"
   agent "$D/q.json" codex-reviewer "Ticket folder: $T"$'\nStage: second-review' 'tool_input.model="fable"' 'tool_use_id="t_q"'
   hook "$D/q.json"; [ "$RC" = 0 ] || fail "Review model: fable must allow the second review: $RC $(cat "$D/hook.err")"
   agent "$D/r.json" codex-reviewer "Ticket folder: $T"$'\nStage: review' 'tool_input.model="fable"' 'tool_use_id="t_r"'
