@@ -1,0 +1,2474 @@
+#!/usr/bin/env bash
+# sa: the superagent state tool.
+# Agents change ticket state only through it, so the board, the ticket file and the log
+# always agree, and a merge happens only when the recorded test and review cover exactly
+# the code that lands. Format details: ~/.claude/superagent/PROTOCOL.md
+#
+#   sa stage   <ticket-dir> <stage|status> ["note"]     set the stage; the status follows
+#   sa ask     <ticket-dir> <from> "<question>" "<option a, recommended>" "<option b>" ["<option c>"]
+#   sa ask     <ticket-dir> <from> --access "<what was tried with computer use>" "<question>" "<a>" "<b>"   only the user can settle it
+#   sa answer  <ticket-dir> <Qn> "<answer>" [--by "<who>"]   who answered, for the room log (default: the user)
+#   sa suggest <tickets-dir> "<project>#NNN <role>" "<idea>" "<why, with evidence>" [small|medium|large]
+#   sa suggest-close <tickets-dir> <Sn> ticketed <NNN> | dismissed ["reason"]
+#   sa learn   <tickets-dir> <from> "<one line>"
+#   sa qa      <ticket-dir> "<steps -> expected>"        add a check only the user can do
+#   sa qa-pass <ticket-dir>                              tick that ticket's checks
+#   sa fresh   <worktree> <base>                         is the branch up to date with base?
+#   sa dirty   <worktree>                                uncommitted changes, tool folders aside
+#   sa selfcheck <worktree> <base>                       leftovers in the lines this branch adds
+#   sa gate    <ticket-dir> <worktree> <base> [--allow-stale]
+#   sa land    <ticket-dir> <worktree> <base> [--message "<msg>"]   gate, then merge locally; never pushes
+#   sa room note  <ticket-dir|tickets-dir> <who> "<text>"   register a change made outside sa in the decision room
+#   sa room event <ticket-dir|tickets-dir> dispatch|report|question|answer <who> "<text>"   log an agent's start, report, or a question or answer sa ask/answer did not log
+#   sa room index <workspace>                            rewrite decision-room/INDEX.md from the ticked projects
+#   sa room hook  pre|post                               the router session's hooks (router-settings.json): hook JSON on stdin; refuses (exit 2, one stderr line) an Agent start above the tier (SA_TIER=off: never); otherwise never fails, prints nothing
+#   sa room seat  ...                                    the room's seats (seat.sh)
+#   sa room decide <ticket-dir|tickets-dir> <Qn|ready|plan|merge|Sn|other> "<question>" --option "<a>" --option "<b>" (--fable <l> "<why>" | --fable-unavailable "<why>") (--codex <l> "<why>" | --codex-unavailable "<why>") [--seat <name> <l> "<why>" | --seat-unavailable <name> "<why>"] [--evidence <seat> "<text>" | --no-evidence <seat>] [--steelman <seat> "<best other argument>" "<would change my mind>"] [--test <l|none> "<command>" "<result>"] [--referee <model> <l|unsure> "<why>"] [--safer <l> "<why>"]
+#   sa room on     <workspace> <YYYY-MM-DD> "<the user's words>" [<tickets-dir>...]   the decision room decides instead of the user
+#   sa room off    <workspace> "<why>" [<tickets-dir>...]   the room has no authority; every decision goes to the user
+#   sa room status <workspace>                           prints on or off (ROUTER-PREFS.md; no line means off)
+#   sa room context <ticket-dir|tickets-dir> [<Qn|ready|plan|merge|Sn|other>]   with a subject, the reading set of that decision: the ticket's log lines, the decisions in force, open questions, each note cut to what the subject needs; without one, the older digest. Reads only
+#   sa room owner  <ticket-dir> <Qn> "<why>" | <tickets-dir> <Sn> "<why>"   mark an open item only the user can settle (a draft's Qn in rd.md gets "(access)")
+#   sa stats <workspace> [hours]                        spend per role and model, and how tickets flowed (default: last 24 h). Reads only
+#   sa room pr-ok  <ticket-dir>                          may an agent merge this ticket's PR on GitHub? Reads only
+#   sa room watch [<workspace>] [--since <minutes>] [--project <name>] [--color auto|always|never]   follow every project's room log live, each agent in its colour (Ctrl-C stops; reads only)
+#   sa run-options <ticket-dir|tickets-dir> <role> "<stage or mode>"   the model and effort to start that agent with: the ticket's line, else the project's, else the tier table. Reads only
+#   sa protocol <role>                                   the parts of PROTOCOL.md that role needs. Reads only
+#   sa digest  <ticket-dir>                              rebuild <room>/<project>/digest/NNN.md: the ticket's newest log lines, decisions, open questions and files (sa refreshes it after each room-log line)
+#   sa cleanup <ticket-dir> [--dry-run]                  remove a done ticket's merged, clean worktrees and their branches
+#   sa queue ...                                         the queue of ready work (flow.py)
+#   sa sweep ...                                         the sweep of stale state (flow.py)
+#
+# Stages: research design plan plan-review approve-plan build report test review approve-merge merge check done
+# Statuses set directly: draft ready blocked failed dropped stopped, and "resume" (status from the stage).
+# A refused call prints "refused: <reason>" and exits 1. That is policy, not a temporary error.
+set -u
+
+STAGES="research design plan plan-review approve-plan build report test review approve-merge merge check done"
+
+die() { echo "refused: $*"; exit 1; }
+now() { date '+%Y-%m-%d %H:%M'; }
+today() { date '+%Y-%m-%d'; }
+replace_file() { command mv -f "$1" "$2"; }   # same folder, so the swap is atomic
+oneline() { printf '%s' "$1" | tr '\r\n' '  '; } # a record field never spans lines
+own_line() { # own_line <file>...: end each with a newline, so that the next ">>" starts on its own line
+  local f last
+  for f in "$@"; do
+    [ -f "$f" ] && [ -s "$f" ] || continue
+    # the last byte as a number: bash drops a NUL in $(...), so a file ending in NUL would look terminated.
+    # Empty means the file could not be read: leave it alone.
+    last=$(tail -c 1 "$f" 2>/dev/null | od -An -tu1 | tr -d ' \n')
+    if [ -n "$last" ] && [ "$last" != "10" ]; then { printf '\n' >> "$f"; } 2>/dev/null; fi
+  done
+  return 0
+}
+
+# Who wrote a line (superagent#007). Every line sa appends to a room log or to tickets/LOG.md starts with the
+# badge of the agent role behind it, so the owner can tell at a glance whose line it is. The badge comes from
+# this one table, in this order: the role the command names (the who of room note and room event and of ask,
+# the --by of answer, the role in the "<project>#NNN <role>" of suggest and learn), else the environment
+# variable SA_ROLE, else the command's own role (room decide, land), else the unknown badge. A role that is
+# not in the table is skipped, never an error. Lines already in a log are never rewritten, and no reader
+# of these files depends on the badge: it is the first word of a line whose other fields are as before.
+# One row per badge: the badge, a space, the role names it stands for (lower case, "," between them).
+BADGE_TABLE='🧭 router
+🏛️ decision-room,decision room
+✍️ clerk,ticket-writer
+🔨 worker
+🤝 teammate
+🐞 reproducer
+🧪 tester
+🔍 reviewer,codex-reviewer
+🔀 merger
+🌐 checker
+🐶 watchdog,follow-up
+👤 user,owner,the user'
+BADGE_OTHER='❔'
+SEAT_FABLE='🟣'; SEAT_CODEX='🟢'; SEAT_CARBON='🔵'   # the seats of a record in DECISIONS.md
+# The colour of each agent in `sa room watch` (superagent#010): one row per badge of the table above, in its order: the
+# badge, a space, and the SGR parameters of that agent's colour. They are 256-colour codes of a middle brightness, readable
+# on a dark and on a light background, and none is the red, the bold magenta or the bold green that the viewer keeps for
+# a failure, a decision and a landing. The unknown badge and a line with no badge get no colour. Only the viewer reads this.
+BADGE_COLORS='🧭 38;5;33
+🏛️ 38;5;97
+✍️ 38;5;103
+🔨 38;5;172
+🤝 38;5;137
+🐞 38;5;100
+🧪 38;5;29
+🔍 38;5;37
+🔀 38;5;63
+🌐 38;5;74
+🐶 38;5;66
+👤 38;5;141'
+ROLE_NAMED=""; ROLE_OWN=""; BADGE=""
+role_key() { # role_key <words>: the role name to look up: lower case, single spaces, no leading "<project>#NNN",
+  # and a decision room's "D<n>" dropped. LC_ALL=C: bytes only, whatever the locale or the text.
+  oneline "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' 2>/dev/null |
+    LC_ALL=C sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//; s/^[^ ]*#[0-9]+ //; s/^decision[ -]room( .*|\(.*)?$/decision-room/' 2>/dev/null
+}
+badge_of() { # badge_of <role words>: the badge of a role named in the table; nothing when it is not there
+  local k row
+  [ -n "${1:-}" ] || return 0   # no role named: nothing to look up
+  k=$(role_key "$1")
+  case "$k" in ""|*,*) return 0 ;; esac
+  while IFS= read -r row; do
+    case ",${row#* }," in *",$k,"*) printf '%s' "${row%% *}"; return 0 ;; esac
+  done <<< "$BADGE_TABLE"
+  return 0
+}
+role_badge() { # sets BADGE for every line this command writes: the named role, else SA_ROLE, else its own role, else unknown
+  [ -z "$BADGE" ] || return 0
+  BADGE=$(badge_of "$ROLE_NAMED")
+  [ -n "$BADGE" ] || BADGE=$(badge_of "${SA_ROLE:-}")
+  [ -n "$BADGE" ] || BADGE=$(badge_of "$ROLE_OWN")
+  [ -n "$BADGE" ] || BADGE=$BADGE_OTHER
+  return 0
+}
+badge_legend() { # one line naming every badge and its roles, read from the table: the legend of a new log, record or index
+  local row names line=""
+  while IFS= read -r row; do
+    names=${row#* }
+    line="$line${row%% *} ${names//,//}, "
+  done <<< "$BADGE_TABLE"
+  printf 'Badges: %s%s anything else\n' "$line" "$BADGE_OTHER"
+}
+
+# The decision room: <workspace>/decision-room/<project>/LOG.md, one line per change, appended only by sa.
+# The workspace is the nearest folder above the project holding ACTIVE-PROJECTS.md; else PROJECT.md's
+# "Room: <absolute path>" names the room; else there is none and nothing is written.
+ROOM_LOG=""; ROOM_NAME=""; ROOM_TID=""; ROOM_OK=1; ROOM_IN_ASK=0; ROOM_MOVE=""; ROOM_PREFS=""
+room_find() { # sets ROOM_LOG ROOM_NAME ROOM_PREFS (the file holding the switch) for $TICKETS; reads only
+  local pdir d ws="" room
+  ROOM_LOG=""; ROOM_NAME=""; ROOM_PREFS=""
+  pdir=$(dirname "$TICKETS")
+  # <p>/docs/tickets is the docs layout of <p>, unless <p>/docs is a repo (a project) of its own
+  case "$TICKETS" in */spec/tickets|*/specs/tickets|*/docs/tickets) [ -e "$pdir/.git" ] || pdir=$(dirname "$pdir") ;; esac
+  d=$pdir
+  while :; do
+    [ -f "$d/ACTIVE-PROJECTS.md" ] && { ws=$d; break; }
+    { [ "$d" = "/" ] || [ "$d" = "." ]; } && break
+    d=$(dirname "$d")
+  done
+  if [ -n "$ws" ]; then
+    room="$ws/decision-room"; ROOM_NAME=${pdir#"$ws"/}
+    [ "$pdir" = "$ws" ] && ROOM_NAME="."   # the workspace's own project: no child's relative path is "."
+  else
+    room=$(sed -n 's/^Room:[[:space:]]*//p' "$TICKETS/PROJECT.md" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')
+    case "$room" in /*) ;; *) return 0 ;; esac
+    ROOM_NAME=$(sed -n 's/^# Project:[[:space:]]*//p' "$TICKETS/PROJECT.md" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')
+    [ -n "$ROOM_NAME" ] || ROOM_NAME=$(basename "$pdir")
+  fi
+  ROOM_LOG="$room/$ROOM_NAME/LOG.md"
+  [ "$ROOM_NAME" = "." ] && ROOM_LOG="$room/LOG.md"
+  ROOM_PREFS="$(dirname "$room")/ROUTER-PREFS.md"   # the workspace's, or the parent folder of a Room: path
+  return 0
+}
+room_switch() { # room_switch <ROUTER-PREFS.md>: on or off. The word after the last "Decision room:" of the
+  # last line holding it decides; anything but "on", no line and no file are off.
+  local w=""
+  [ -f "$1" ] && w=$(grep -F 'Decision room:' "$1" 2>/dev/null | tail -1 | sed 's/.*Decision room:[[:space:]]*//; s/[^A-Za-z].*//')
+  if [ "$w" = on ]; then echo on; else echo off; fi
+}
+room_ref() { oneline "$ROOM_NAME${ROOM_TID:+#$ROOM_TID}" | tr '|' '/'; }   # the ref never holds a separator
+room_log() { # room_log <kind> "<text>": one whole line in the project's room log, or none; never fails the command
+  ROOM_OK=1
+  [ "${ROOM_FIXED:-}" = 1 ] || room_find   # the router's hook resolves the log itself (superagent#008)
+  [ -n "$ROOM_LOG" ] || return 0
+  local ref size="" held=0 lead=""
+  ref=$(room_ref)
+  role_badge
+  [ "$LOGLOCK" = "$ROOM_LOG.lock" ] && held=1
+  if mkdir -p "$(dirname "$ROOM_LOG")" 2>/dev/null && log_lock; then
+    own_line "$ROOM_LOG"
+    size=$(log_size) || size=""   # unknown length: no append, since a half line could not be taken back
+    [ "$size" != 0 ] || lead="# $(badge_legend)"$'\n'   # a log with nothing in it starts with its legend; an existing one never gets one
+    # the badge (and a new log's legend) has its own printf, so that the line's own printf is the one it always was,
+    # each redirected on its own: a write cut short must leave no buffered text to be flushed to the caller's stdout
+    if [ -z "$size" ] || ! { printf '%s%s ' "$lead" "$BADGE" >> "$ROOM_LOG" && printf '%s | %s | %s | %s\n' "$(now)" "$ref" "$1" "$(oneline "$2")" >> "$ROOM_LOG"; } 2>/dev/null; then
+      ROOM_OK=0
+      [ -z "$size" ] || room_cut "$size"
+    fi
+    [ "$held" = 1 ] || log_unlock
+  else
+    ROOM_OK=0
+  fi
+  [ "$ROOM_OK" = 1 ] || echo "note: could not write the decision-room log"
+  [ "$ROOM_OK" = 1 ] && digest_refresh
+  return 0
+}
+log_size() { # the room log's length in bytes (0 when absent); fails when it cannot be read
+  local n
+  [ -e "$ROOM_LOG" ] || { echo 0; return 0; }
+  n=$( { wc -c < "$ROOM_LOG"; } 2>/dev/null ) || return 1
+  n=${n//[[:space:]]/}
+  case "$n" in ""|*[!0-9]*) return 1 ;; esac
+  echo "$n"
+}
+room_cut() { # room_cut <length before the append>: take back a half-written line (the caller holds the log lock)
+  local now_size
+  now_size=$(log_size) || { echo "note: could not take back a half-written line in $ROOM_LOG"; return 0; }
+  [ "$now_size" -gt "$1" ] || return 0
+  dd if=/dev/null of="$ROOM_LOG" bs=1 seek="$1" count=0 2>/dev/null   # truncates at the seek point; needs no free space
+  [ "$(log_size)" = "$1" ] || echo "note: could not take back a half-written line in $ROOM_LOG"
+  return 0
+}
+# Every writer of one room log holds its lock while it measures, appends and takes back: two projects
+# with different tickets folders (and so different tickets locks) can share one log (a Room: line).
+# An flock(2) on an open descriptor: the kernel drops it when its holder exits or dies, so there is no
+# stale lock to reclaim and no owner file to write. perl takes it on our fd 9 and exits; the lock stays
+# with the open file until log_unlock closes fd 9.
+LOGLOCK=""
+log_lock() { # 1 when the lock file cannot be opened, perl is missing, or the lock is held for 60s (LOGLOCK_TRIES x 0.1s)
+  [ "$LOGLOCK" = "$ROOM_LOG.lock" ] && return 0
+  { exec 9>>"$ROOM_LOG.lock"; } 2>/dev/null || return 1
+  if perl -MFcntl=:flock -e 'open(my $fh, ">&=", 9) or exit 2;
+      for (1 .. $ARGV[0]) { exit 0 if flock($fh, LOCK_EX | LOCK_NB); select(undef, undef, undef, 0.1) } exit 1' "${LOGLOCK_TRIES:-600}" 2>/dev/null; then
+    LOGLOCK="$ROOM_LOG.lock"
+    return 0
+  fi
+  exec 9>&-
+  return 1
+}
+log_unlock() {
+  [ -z "$LOGLOCK" ] || exec 9>&-
+  LOGLOCK=""
+  return 0
+}
+
+status_for_stage() {
+  case "$1" in
+    research|design|plan|plan-review|approve-plan|build|report) echo in-progress ;;
+    test|review|approve-merge|merge) echo review ;;
+    check) echo merged ;;
+    done) echo "done" ;;
+    *) echo "" ;;
+  esac
+}
+
+LOCKDIR=""
+unlock() {
+  log_unlock
+  [ -n "$LOCKDIR" ] && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] && { rm -f "$LOCKDIR/pid"; rmdir "$LOCKDIR" 2>/dev/null; }
+  return 0
+}
+lock() { # one sa at a time per tickets folder; the lock names its owner
+  [ -n "$LOCKDIR" ] && return 0
+  local d="$1/.sa.lock" i=0 owner="" age stale
+  while ! mkdir "$d" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -ge 600 ] && die "could not lock $1 after 60s (held by pid ${owner:-unknown}). If no sa is running, remove $d"
+    owner=$(cat "$d/pid" 2>/dev/null)
+    stale=0
+    if [ -n "$owner" ]; then
+      kill -0 "$owner" 2>/dev/null || stale=1                      # its owner is gone
+    elif [ -d "$d" ]; then
+      age=$(( $(date +%s) - $(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d" 2>/dev/null || date +%s) ))
+      [ "$age" -gt 30 ] && stale=1                                 # a leftover with no owner
+    fi
+    if [ "$stale" = "1" ] && mkdir "$d.reclaim" 2>/dev/null; then
+      # one waiter at a time, and only the very lock it judged dead: look at it again now
+      if [ "$(cat "$d/pid" 2>/dev/null)" = "$owner" ]; then
+        if [ -n "$owner" ]; then
+          rm -f "$d/pid"; rmdir "$d" 2>/dev/null
+        else
+          age=$(( $(date +%s) - $(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d" 2>/dev/null || date +%s) ))
+          [ "$age" -gt 30 ] && rmdir "$d" 2>/dev/null    # a lock just taken is young, and is left alone
+        fi
+      fi
+      rmdir "$d.reclaim" 2>/dev/null
+      continue
+    fi
+    sleep 0.1
+  done
+  LOCKDIR="$d"
+  echo $$ > "$LOCKDIR/pid"
+  trap unlock EXIT
+}
+
+tickets_vars() { # sets TICKETS BOARD
+  [ -d "${1:-}" ] || die "no such tickets folder: ${1:-}"
+  TICKETS=$(cd "$1" && pwd)
+  ROOM_TID=""
+  BOARD=""
+  local b
+  for b in BOARD.md board.md; do [ -f "$TICKETS/$b" ] && { BOARD="$TICKETS/$b"; break; }; done
+  [ -n "$BOARD" ] || die "no BOARD.md in $TICKETS (pass the tickets folder)"
+}
+
+ticket_vars() { # sets TDIR TICKETS BOARD ID SLUG RD NOTES
+  local d="${1%/}" name
+  [ -f "$d/rd.md" ] || die "no rd.md in '$d' (pass the ticket folder, e.g. <project>/tickets/003-slug)"
+  name=$(basename "$d")
+  case "$name" in [0-9][0-9][0-9]-*) ;; *) die "ticket folder must be named NNN-slug, got '$name'" ;; esac
+  ID=${name%%-*}
+  SLUG=${name#*-}
+  tickets_vars "$d/.."
+  ROOM_TID=$ID
+  TDIR="$TICKETS/$name"
+  RD="$TDIR/rd.md"
+  NOTES="$TDIR/notes"
+}
+
+rd_field() { # rd_field <Name>: value of a header line (before the first "## ")
+  awk -v k="$1:" '/^## /{exit} index($0,k)==1 { v=substr($0,length(k)+1); gsub(/^[ \t]+|[ \t\r]+$/,"",v); print v; exit }' "$RD"
+}
+
+rd_open_questions() {
+  awk '/^## Open questions/{f=1; next} /^## /{f=0} f && /^[-* \t]*Q[0-9]+/ {n++} END{print n+0}' "$RD"
+}
+
+board_get() { # prints "status|stage" of this ticket's row
+  awk -F'|' -v id="$ID" '
+    { c=$2; gsub(/[ \t]/,"",c) }
+    c==id {
+      if (index($0, "\\|") || $0 !~ /\|[ \t]*$/) { print "unreadable|-"; exit }
+      s=$4; sub(/^[ \t]+/,"",s); split(s,a,/[ \t:(]/); g=(NF>=8)?$7:"-"; gsub(/[ \t]/,"",g); if (g=="") g="-"; print a[1] "|" g; exit }' "$BOARD"
+}
+
+board_write() { # board_write <status> <stage>: the new board on stdout. Exit 3: no row. Exit 4: a table shape sa does not rewrite.
+  awk -F'|' -v OFS='|' -v id="$ID" -v st="$1" -v sg="$2" '
+    function trim(x) { gsub(/^[ \t]+|[ \t]+$/,"",x); return x }
+    function shape() { if ($0 !~ /\|[ \t]*$/ || index($0, "\\|")) { bad=1; exit } }
+    /^\|[ \t]*ID[ \t]*\|/ { shape(); if (NF<8) { print $0 " Stage |"; widen=1 } else print; next }
+    /^[-|: \t]+$/ && /-/ { if (widen) print $0 "-------|"; else print; next }
+    /^\|[ \t]*[0-9][0-9][0-9][ \t]*\|/ {
+      shape()
+      if (NF<8) $0 = $0 " - |"
+      if (trim($2)==id) { $4=" " st " "; $7=" " sg " "; found=1 }
+      print; next }
+    { print }
+    END { if (bad) exit 4; if (!found) exit 3 }' "$BOARD"
+}
+
+rd_has_status() { awk '/^## /{exit} /^Status:/{f=1} END{exit !f}' "$RD"; }
+
+rd_write() { # rd_write <status> <stage>: the new rd.md on stdout
+  local has=0
+  awk '/^## /{exit} /^Stage:/{f=1} END{exit !f}' "$RD" && has=1
+  awk -v st="$1" -v sg="$2" -v has="$has" '
+    BEGIN { hdr=1 }
+    /^## / { hdr=0 }
+    hdr && /^Status:/ && !ds { print "Status: " st; ds=1; if (!has) print "Stage: " sg; next }
+    hdr && /^Stage:/ && !dg { print "Stage: " sg; dg=1; next }
+    { print }' "$RD"
+}
+
+set_state() { # set_state <token> <note>; caller holds the lock
+  local tok="$1" note="${2:-}" cur ost osg nst nsg
+  cur=$(board_get)
+  [ -n "$cur" ] || die "no row for $ID in $(basename "$BOARD")"
+  ost=${cur%%|*}; osg=${cur##*|}
+  [ "$ost" != "unreadable" ] || die "the row of $ID in $(basename "$BOARD") cannot be read (it must end with '|' and hold no escaped pipe); fix the table first"
+  if [ "$ost" = "stopped" ] || [ "$(rd_field Status)" = "stopped" ]; then
+    case "$tok" in resume|ready|dropped|stopped) ;; *) die "$ID is stopped by the user; only the router lifts a stop (sa stage <ticket-dir> resume)" ;; esac
+  fi
+  case " $STAGES " in
+    *" $tok "*) nsg=$tok; nst=$(status_for_stage "$tok") ;;
+    *) case "$tok" in
+        blocked|failed|dropped|stopped) nst=$tok; nsg=$osg ;;
+        draft) nst=draft; nsg="-" ;;
+        ready)
+          case "$ost" in draft|ready|blocked|stopped|failed) ;; *) die "$ID is '$ost'; only a draft, blocked, stopped or failed ticket can be marked ready" ;; esac
+          [ "$(rd_open_questions)" = "0" ] || die "$ID has open questions in rd.md; the user answers them first"
+          nst=ready; nsg="-" ;;
+        resume)
+          nsg=$osg; nst=$(status_for_stage "$osg"); [ -n "$nst" ] || nst=ready
+          if { [ -f "$NOTES/questions.md" ] && [ "$(grep -c '^## Q[0-9][0-9]* \[open\]' "$NOTES/questions.md" 2>/dev/null || true)" != "0" ]; } || [ "$(rd_open_questions)" != "0" ]; then
+            nst=blocked; note="$note (still has an open question)"
+          fi ;;
+        *) die "unknown stage or status '$tok'. Stages: $STAGES. Statuses: draft ready blocked failed dropped stopped resume" ;;
+      esac ;;
+  esac
+  # prepare both files first, then swap both, so the board and the ticket never disagree
+  rd_has_status || die "rd.md of $ID has no 'Status:' line in its header; add one, then run this again"
+  local btmp="$BOARD.sa.$$" rtmp="$RD.sa.$$" rc
+  board_write "$nst" "$nsg" > "$btmp"; rc=$?
+  if [ "$rc" != "0" ] || [ ! -s "$btmp" ]; then
+    rm -f "$btmp"
+    [ "$rc" = "4" ] && die "$(basename "$BOARD") has a row or header sa does not rewrite (it must end with '|' and hold no escaped pipe); fix the table first"
+    die "no row for $ID in $(basename "$BOARD")"
+  fi
+  if ! rd_write "$nst" "$nsg" > "$rtmp" || [ ! -s "$rtmp" ]; then rm -f "$btmp" "$rtmp"; die "could not prepare the new rd.md of $ID"; fi
+  local bbak="$BOARD.bak.sa.$$"
+  command cp -p "$BOARD" "$bbak" || { rm -f "$btmp" "$rtmp"; die "could not back up the board"; }
+  if ! replace_file "$btmp" "$BOARD"; then rm -f "$btmp" "$rtmp" "$bbak"; die "could not write the board; nothing changed"; fi
+  if ! replace_file "$rtmp" "$RD"; then
+    rm -f "$rtmp"
+    command mv -f "$bbak" "$BOARD" || die "could not write rd.md of $ID, and could not put the board back; its previous content is in $bbak"
+    die "could not write rd.md of $ID; the board was put back"
+  fi
+  rm -f "$bbak"
+  # agents append rounds and approvals to these; without a final newline the next header would be glued to the last line
+  own_line "$NOTES/test.md" "$NOTES/review.md" "$NOTES/plan-review.md" "$NOTES/check.md" "$NOTES/merge.md" "$NOTES/plan.md"
+  [ -f "$TICKETS/LOG.md" ] || printf '# Log\n\nOne line per state change, newest last. Written by `sa`; do not edit.\n%s\n\n' "$(badge_legend)" > "$TICKETS/LOG.md"
+  role_badge
+  printf '%s %s | %s | %s/%s -> %s/%s | %s\n' "$BADGE" "$(now)" "$ID" "$ost" "$osg" "$nst" "$nsg" "$(oneline "$note")" >> "$TICKETS/LOG.md" || echo "note: could not write LOG.md"
+  ROOM_MOVE="$ost/$osg -> $nst/$nsg"
+  [ "$ROOM_IN_ASK" = "1" ] || room_log stage "$ROOM_MOVE${note:+: $note}"   # ask logs the move in its own question line
+  echo "$ID $SLUG: $ost/$osg -> $nst/$nsg"
+}
+
+cmd_stage() {
+  [ $# -ge 2 ] || die "usage: sa stage <ticket-dir> <stage|status> [\"note\"]"
+  ticket_vars "$1"
+  lock "$TICKETS"
+  set_state "$2" "${3:-}"
+}
+
+cmd_ask() {
+  [ $# -ge 5 ] || die "usage: sa ask <ticket-dir> <from> \"<question>\" \"<option a, recommended>\" \"<option b>\" [\"<option c>\"]"
+  ticket_vars "$1"
+  local from q f n letter opt stage tried="" access=0 optlog=""
+  from=$(oneline "$2"); shift 2
+  ROLE_NAMED=$from
+  if [ "$1" = "--access" ]; then   # only the user can settle it: what was tried goes with it (FR-7 of superagent#003)
+    tried=$(oneline "$2"); access=1; shift 2
+    [ -n "${tried//[[:space:]]/}" ] || die "an access question needs what was tried with computer use, and how it was blocked: sa ask <ticket-dir> <from> --access \"<what you tried>\" \"<question>\" \"<a>\" \"<b>\""
+    [ $# -ge 3 ] || die "usage: sa ask <ticket-dir> <from> --access \"<what was tried>\" \"<question>\" \"<option a, recommended>\" \"<option b>\""
+  fi
+  q=$(oneline "$1"); shift
+  [ -n "$q" ] || die "empty question"
+  mkdir -p "$NOTES"
+  f="$NOTES/questions.md"
+  lock "$TICKETS"
+  n=$(( $(grep -c '^## Q[0-9][0-9]* \[' "$f" 2>/dev/null || true) + 1 ))
+  stage=$(board_get); stage=${stage##*|}
+  {
+    [ -s "$f" ] && echo
+    echo "## Q$n [open]"
+    echo "Asked: $(now) by $from, at stage $stage"
+    echo "Question: $q"
+    [ "$access" = 1 ] && printf 'Kind: access\nTried: %s\n' "$tried"
+    letter=a
+    for opt in "$@"; do
+      opt=$(oneline "$opt")
+      [ -n "$opt" ] || continue
+      if [ "$letter" = "a" ]; then
+        case "$opt" in *ecommended*) ;; *) opt="$opt (recommended)" ;; esac
+      fi
+      echo "($letter) $opt"
+      optlog="$optlog${optlog:+; }($letter) $opt"
+      case "$letter" in a) letter=b ;; b) letter=c ;; *) letter=d ;; esac
+    done
+    echo "Answer:"
+  } >> "$f"
+  ROOM_IN_ASK=1
+  set_state blocked "question Q$n from $from" >/dev/null
+  room_log question "$ROOM_MOVE: Q$n from $from: $q | options: $optlog"   # one line, only once set_state has not refused
+  echo "Q$n recorded; $ID is blocked until the user answers"
+}
+
+cmd_answer() {
+  [ $# -ge 3 ] || die "usage: sa answer <ticket-dir> <Qn> \"<answer>\" [--by \"<who>\"]"
+  local by="the user"
+  if [ "${4:-}" = "--by" ]; then   # who answered goes to the room log only, never into questions.md
+    by=$(oneline "${5:-}")
+    [ -n "${by//[[:space:]]/}" ] || die "--by needs who answered: sa answer <ticket-dir> <Qn> \"<answer>\" --by \"<who>\""
+  fi
+  ticket_vars "$1"
+  ROLE_NAMED=$by
+  local f="$NOTES/questions.md" tmp q
+  [ -f "$f" ] || die "no notes/questions.md for $ID"
+  lock "$TICKETS"
+  tmp="$f.sa.$$"
+  q=$(SA_Q="$2" awk '$0 == "## " ENVIRON["SA_Q"] " [open]" { inq=1; next } /^## / { inq=0 }
+    inq && /^Question: / { sub(/^Question: /, ""); print; exit }' "$f" 2>/dev/null)
+  SA_Q="$2" SA_ANS="$(oneline "$3")" SA_DATE="$(today)" awk '
+    $0 == "## " ENVIRON["SA_Q"] " [open]" { print "## " ENVIRON["SA_Q"] " [answered]"; inq=1; found=1; next }
+    /^## / { inq=0 }
+    inq && /^Answer:/ { print "Answer: " ENVIRON["SA_ANS"] " (" ENVIRON["SA_DATE"] ")"; next }
+    { print }
+    END { if (!found) exit 3 }' "$f" > "$tmp" || { rm -f "$tmp"; die "no open question $2 in notes/questions.md of $ID"; }
+  replace_file "$tmp" "$f" || { rm -f "$tmp"; die "could not write notes/questions.md of $ID"; }
+  room_log answer "$2 answered by $by: $3 | question: $q"
+  echo "$2 answered; open questions left: $(grep -c '^## Q[0-9][0-9]* \[open\]' "$f" || true)"
+}
+
+cmd_suggest() {
+  [ $# -ge 4 ] || die "usage: sa suggest <tickets-dir> \"<project>#NNN <role>\" \"<idea>\" \"<why, with evidence>\" [small|medium|large]"
+  tickets_vars "$1"
+  local from idea why size f n
+  from=$(oneline "$2"); idea=$(oneline "$3"); why=$(oneline "$4"); size=$(oneline "${5:-small}")
+  ROLE_NAMED=$from
+  [ -n "$idea" ] && [ -n "$why" ] || die "a suggestion needs an idea and the evidence for it"
+  case "$from" in *'#'[0-9]*) ;; *) die "say which ticket you were on: <from> must look like \"my-app#007 tester\", got \"$from\"" ;; esac
+  f="$TICKETS/SUGGESTIONS.md"
+  lock "$TICKETS"
+  [ -f "$f" ] || printf '# Suggestions\n\nThings agents noticed outside their ticket. Nothing here is approved work: the router asks the user.\n' > "$f"
+  if grep -qiFx "Idea: $idea" "$f"; then echo "already suggested"; return 0; fi
+  n=$(( $(grep -c '^## S[0-9][0-9]* \[' "$f" || true) + 1 ))
+  printf '\n## S%s [open]\nFrom: %s, %s\nIdea: %s\nWhy: %s\nSize: %s\n' "$n" "$from" "$(today)" "$idea" "$why" "$size" >> "$f"
+  room_log suggestion "S$n from $from: $idea"
+  echo "S$n recorded"
+}
+
+cmd_suggest_close() {
+  [ $# -ge 3 ] || die "usage: sa suggest-close <tickets-dir> <Sn> ticketed <NNN> | dismissed [\"reason\"]"
+  tickets_vars "$1"
+  local f="$TICKETS/SUGGESTIONS.md" tmp label
+  [ -f "$f" ] || die "no SUGGESTIONS.md in $TICKETS"
+  case "$3" in
+    ticketed) [ -n "${4:-}" ] || die "ticketed needs the ticket id"; label="ticketed $(oneline "$4")" ;;
+    dismissed) label="dismissed"; [ -n "${4:-}" ] && label="dismissed: $(oneline "$4")" ;;
+    *) die "close with 'ticketed <NNN>' or 'dismissed'" ;;
+  esac
+  lock "$TICKETS"
+  tmp="$f.sa.$$"
+  SA_S="$2" SA_L="$label" awk '
+    $0 == "## " ENVIRON["SA_S"] " [open]" { print "## " ENVIRON["SA_S"] " [" ENVIRON["SA_L"] "]"; found=1; next }
+    { print }
+    END { if (!found) exit 3 }' "$f" > "$tmp" || { rm -f "$tmp"; die "no open suggestion $2"; }
+  replace_file "$tmp" "$f" || { rm -f "$tmp"; die "could not write SUGGESTIONS.md"; }
+  room_log suggestion "$2 $label"
+  echo "$2: $label"
+}
+
+cmd_learn() {
+  [ $# -ge 3 ] || die "usage: sa learn <tickets-dir> <from> \"<one line>\""
+  tickets_vars "$1"
+  ROLE_NAMED=$2
+  local f="$TICKETS/LEARNED.md" line n
+  line=$(oneline "$3")
+  [ -n "$line" ] || die "empty line"
+  lock "$TICKETS"
+  [ -f "$f" ] || printf '# Learned in this project\n\nTraps that cost an agent time here. Read before working; add one line with `sa learn`.\n\n' > "$f"
+  if grep -qF -- "- $line (" "$f"; then echo "already recorded"; return 0; fi
+  printf -- '- %s (%s, %s)\n' "$line" "$(oneline "$2")" "$(today)" >> "$f"
+  room_log lesson "from $2: $line"
+  n=$(grep -c '^- ' "$f" || true)
+  echo "recorded ($n lines)"
+  [ "$n" -gt 30 ] && echo "note: LEARNED.md is long; the router should have the ticket-writer fold stable lines into PROJECT.md"
+  return 0
+}
+
+cmd_qa() {
+  [ $# -ge 2 ] || die "usage: sa qa <ticket-dir> \"<steps -> expected>\""
+  ticket_vars "$1"
+  local f="$TICKETS/QA.md" text
+  text=$(oneline "$2")
+  [ -n "$text" ] || die "empty check"
+  lock "$TICKETS"
+  [ -f "$f" ] || printf '# To try yourself\n\nChecks only the user can do (device, microphone, purchases). Added by `sa qa`, ticked by `sa qa-pass`.\n\n' > "$f"
+  if grep -qF -- "#$ID $SLUG: $text" "$f"; then echo "already listed"; return 0; fi
+  printf -- '- [ ] #%s %s: %s\n' "$ID" "$SLUG" "$text" >> "$f"
+  room_log check "added: $text"
+  echo "added to QA.md"
+}
+
+cmd_qa_pass() {
+  [ $# -ge 1 ] || die "usage: sa qa-pass <ticket-dir>"
+  ticket_vars "$1"
+  local f="$TICKETS/QA.md" tmp
+  [ -f "$f" ] || die "no QA.md in $TICKETS"
+  lock "$TICKETS"
+  tmp="$f.sa.$$"
+  SA_P="- [ ] #$ID " SA_D="$(today)" awk '
+    index($0, ENVIRON["SA_P"]) == 1 { print "- [x]" substr($0, 6) " (ok " ENVIRON["SA_D"] ")"; n++; next }
+    { print }
+    END { print n+0 > "/dev/stderr" }' "$f" > "$tmp" 2> "$tmp.n" || { rm -f "$tmp" "$tmp.n"; die "could not rewrite QA.md"; }
+  [ -s "$tmp" ] && replace_file "$tmp" "$f" || { rm -f "$tmp" "$tmp.n"; die "could not write QA.md"; }
+  room_log check "ticked $(cat "$tmp.n") check(s)"
+  echo "ticked $(cat "$tmp.n") check(s) of #$ID"
+  rm -f "$tmp.n"
+}
+
+git_ok() { git -C "$1" rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout: $1"; }
+
+# Uncommitted changes that matter. Folders that tools drop into a checkout (Codex's .omx, for one)
+# are not the ticket's work and never count.
+wt_changes() { git -C "$1" status --porcelain 2>/dev/null | grep -v -E '^\?\? \.(omx|omc|claude|codex)/$' || true; }
+
+cmd_dirty() {
+  [ $# -ge 1 ] || die "usage: sa dirty <worktree>"
+  git_ok "$1"
+  local out
+  out=$(wt_changes "$(git -C "$1" rev-parse --show-toplevel)")
+  if [ -z "$out" ]; then echo "clean"; else printf '%s\n' "$out"; echo "uncommitted: $(printf '%s\n' "$out" | wc -l | xargs) path(s)"; return 1; fi
+}
+
+cmd_fresh() {
+  [ $# -ge 2 ] || die "usage: sa fresh <worktree> <base>"
+  git_ok "$1"
+  git -C "$1" rev-parse --verify -q "$2^{commit}" >/dev/null || die "no such base '$2' in $1"
+  if git -C "$1" merge-base --is-ancestor "$2" HEAD; then
+    echo "fresh: this branch contains $2 ($(git -C "$1" rev-parse --short "$2"))"
+  else
+    echo "stale: $2 has $(git -C "$1" rev-list --count "HEAD..$2") commit(s) this branch lacks. Next: in the worktree run 'git merge $2', resolve, re-run the checks, commit"
+    return 1
+  fi
+}
+
+cmd_selfcheck() {
+  [ $# -ge 2 ] || die "usage: sa selfcheck <worktree> <base>"
+  git_ok "$1"
+  git -C "$1" rev-parse --verify -q "$2^{commit}" >/dev/null || die "no such base '$2' in $1"
+  git -C "$1" diff --unified=0 --no-color "$2...HEAD" | awk '
+    /^\+\+\+ / { file=substr($0,7); if ($0 ~ /^\+\+\+ \/dev\/null/) file=""; next }
+    /^--- / { next }
+    /^@@ / { s=$0; sub(/^@@ -[0-9,]+ \+/,"",s); sub(/[, ].*$/,"",s); ln=s+0; next }
+    /^\+/ {
+      if (file != "") {
+        t=substr($0,2); low=tolower(t); kind=""
+        skip = (file ~ /(^|\/)(node_modules|vendor|dist|build)\// || file ~ /(\.lock|-lock\.json|\.min\.js|\.snap)$/)
+        doc = (file ~ /\.(md|mdx|txt)$/)
+        if (!skip) {
+          if (t ~ /^(<<<<<<< |>>>>>>> )/) kind=kind ", conflict marker"
+          if (t ~ /(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY)/ || low ~ /(api[_-]?key|secret|passwd|password|token)["\047]?[ \t]*[:=][ \t]*["\047][a-z0-9_\/+=-]{20,}["\047]/) kind=kind ", possible secret"
+          if (!doc && t ~ /(\.(only|skip)\(|(^|[^A-Za-z_])(xit|xdescribe|fit|fdescribe)\(|XCTSkip|@pytest\.mark\.skip|@Ignore|@Disabled|t\.Skip\()/) kind=kind ", skipped or focused test"
+          if (!doc && t ~ /(TODO|FIXME|XXX|HACK)([^A-Za-z]|$)/) kind=kind ", placeholder"
+          if (!doc && t ~ /(console\.(log|debug)\(|debugger;|binding\.pry|pdb\.set_trace\(|dbg!\()/) kind=kind ", debug leftover"
+          if (kind != "") { n++; sub(/^[ \t]+/,"",t); print "FLAG " substr(kind,3) ": " file ":" ln ": " substr(t,1,120) }
+        }
+      }
+      ln++; next }
+    END { if (n) { print "selfcheck: " n " flag(s). Fix each, or justify it in notes/results.md"; exit 1 } else print "selfcheck: clean" }'
+}
+
+last_round() { # last_round <file> <commit prefix> <verdict prefix>: "commit verdict" of the newest round
+  # The verdict counts only when it follows that round's commit line, so a round that lacks
+  # its verdict never borrows an older one.
+  [ -f "$1" ] || return 0
+  SA_C="$2" SA_V="$3" awk '
+    index($0, ENVIRON["SA_C"]) == 1 { c=$0; sub(/^[^:]*:[ \t]*/, "", c); split(c, a, /[ \t\r]/); commit=a[1]; verdict=""; next }
+    index($0, ENVIRON["SA_V"]) == 1 { v=$0; sub(/^[^:]*:[ \t]*/, "", v); gsub(/[ \t\r]+$/, "", v); verdict=(v ~ /^[A-Za-z]+$/) ? tolower(v) : "unclear" }
+    END { print commit, verdict }' "$1"
+}
+
+review_pair() { # review_pair <review.md>: empty when the newest round has both reviewers allowing one commit
+  # The newest round runs from the last '--- Round' line to EOF, except that a '--- User override' or
+  # '--- Decision room override' header outside a ``` fence ends it: then that override block alone decides.
+  # A later '--- Round' makes the override stale; that round needs its own commit and verdict lines.
+  # Without an override, the round's header and any 'Second review' lines must name codex and claude
+  # (a claude-only round names why not Codex: "codex unavailable" / "Codex built this"),
+  # every verdict in it must be yes and every reviewed commit the same.
+  [ -f "$1" ] || return 0
+  awk '
+    /^```/ { fence = !fence }
+    /^--- Round/ { if (ov) sup=1; who=tolower($0); c=""; diff=0; bad=0; n=0; r=1; rn=0; rf=""; rmix=0; ov=0; next }
+    !fence && /^--- (User|Decision room) override(,|[ \t\r]*$)/ { ov=1; oc=""; ocn=0; omix=0; ok=""; sealed=0; late=0; next }
+    ov && (/^--- / || tolower($0) ~ /^second review/) { late=1; next }
+    ov && index($0, "Reviewed commit:") == 1 { if (sealed) late=1; x=$0; sub(/^[^:]*:[ \t]*/, "", x); gsub(/[ \t\r]+$/, "", x); if (ocn++ && x != oc) omix=1; oc=x; ok=""; next }
+    ov && index($0, "Ship allowed:") == 1 { if (sealed) late=1; v=$0; sub(/^[^:]*:[ \t]*/, "", v); gsub(/[ \t\r]+$/, "", v); ok=v; sealed=1; next }
+    ov { next }
+    tolower($0) ~ /^second review/ { who=who " " tolower($0) }
+    index($0, "Reviewed commit:") == 1 { x=$0; sub(/^[^:]*:[ \t]*/, "", x); split(x, a, /[ \t\r]/); if (c != "" && c != a[1]) diff=1; c=a[1]; y=$0; sub(/^[^:]*:[ \t]*/, "", y); gsub(/[ \t\r]+$/, "", y); rn++; if (rn == 1) rf=y; else if (y != rf) rmix=1 }
+    index($0, "Ship allowed:") == 1 { v=tolower($0); sub(/^[^:]*:[ \t]*/, "", v); gsub(/[ \t\r]+$/, "", v); n++; if (v != "yes") bad=1 }
+    END {
+      if (ov) {
+        if (!r) print "an override block in notes/review.md follows no review round. Next: codex-reviewer"
+        else if (late) print "review lines follow the override block, so it is not the last word in notes/review.md. Next: codex-reviewer, next round"
+        else if (omix || length(oc) != 40 || oc ~ /[^0-9a-f]/ || !rn || rmix || oc != rf) print "the override block does not name the full commit id that every '\''Reviewed commit:'\'' line of the newest round names. Next: the clerk rewrites the override with that commit"
+        else if (ok != "yes") print "the override block does not end with '\''Ship allowed: yes'\''. Next: the clerk rewrites the override"
+      }
+      else if (sup && (!rn || !n)) print "the round after the override has no '\''Reviewed commit:'\'' or '\''Ship allowed:'\'' line of its own. Next: codex-reviewer, next round"
+      else if (who !~ /codex/ || who !~ /claude/) print "the newest review round does not name both reviewers (codex and claude). Next: the second reviewer appends a '\''Second review, reviewer: claude (<model id>)'\'' block to the same round"
+      else if (bad) print "a reviewer in the newest round did not allow shipping. Next: the worker fixes the defects, then test and review again"
+      else if (diff) print "the two reviewers in the newest round reviewed different commits. Next: codex-reviewer, next round"
+    }' "$1"
+}
+
+full_sha() { case "$1" in *[!0-9a-f]*|"") return 1 ;; esac; [ "${#1}" = "40" ]; }
+
+GATE_REASONS=""; GATE_HEAD=""; GATE_BASE=""; WT=""
+gate_fail() { GATE_REASONS="$GATE_REASONS- $1
+"; }
+
+run_gate() { # run_gate <ticket-dir> <worktree> <base> <allow-stale 0|1>; 0 on pass. Sets WT GATE_HEAD GATE_BASE.
+  ticket_vars "$1"
+  local base="$3" allow_stale="$4" head basesha tested tres reviewed ship track kind story t q st pair
+  git_ok "$2"
+  WT=$(git -C "$2" rev-parse --show-toplevel)   # never compare from a subfolder
+  basesha=$(git -C "$WT" rev-parse --verify -q "$base^{commit}") || die "no such base '$base' in $WT"
+  head=$(git -C "$WT" rev-parse HEAD)
+  GATE_HEAD=$head; GATE_BASE=$basesha
+  # "the same code" ignores only the review files a ks pipeline commits after its review
+  same_code() { git -C "$WT" diff --quiet "$1" "$2" -- . ':(exclude,glob)docs/reviews/*.md' 2>/dev/null; }
+
+  kind=$(rd_field Kind); track=$(rd_field Track)
+  for st in "$(board_get | cut -d'|' -f1)" "$(rd_field Status)"; do
+    case "$st" in
+      stopped) gate_fail "the ticket is stopped by the user. Next: nothing until the user lifts the stop"; break ;;
+      blocked|failed|dropped|draft) gate_fail "the ticket is '$st'. Next: the router settles that first"; break ;;
+      ready|in-progress|review|merged|done) ;;
+      *) gate_fail "the status of $ID cannot be read ('$st') from the board or rd.md. Next: fix the row with sa stage"; break ;;
+    esac
+  done
+  [ "$kind" = "scout" ] && gate_fail "a scout ticket produces a report, not a merge. Next: nothing to land"
+
+  [ -z "$(wt_changes "$WT")" ] || gate_fail "uncommitted changes in the worktree. Next: the worker commits or removes them, then the tester re-tests"
+  [ "$(git -C "$WT" rev-list --count "$basesha..$head")" -gt 0 ] || gate_fail "no commits beyond $base. Next: nothing to land"
+  if ! git -C "$WT" merge-base --is-ancestor "$basesha" "$head" && [ "$allow_stale" = "0" ]; then
+    gate_fail "$base moved: $(git -C "$WT" rev-list --count "$head..$basesha") new commit(s) the branch lacks. Next: the worker merges $base into the branch, then the tester re-tests"
+  fi
+
+  pair=$(last_round "$NOTES/test.md" 'Tested commit:' 'Result:'); tested=${pair%% *}; tres=${pair#* }
+  if [ -z "$tested" ]; then
+    gate_fail "no test record: notes/test.md needs 'Tested commit: <full commit id>' followed by 'Result: pass'. Next: tester"
+  elif ! full_sha "$tested" || ! git -C "$WT" cat-file -e "$tested^{commit}" 2>/dev/null; then
+    gate_fail "the test record names '$tested', which is not a full commit id of this repo. Next: the tester writes the 40-character id it tested"
+  elif [ "$tres" != "pass" ]; then
+    gate_fail "the last test round's result is '${tres:-missing}', not pass. Next: the worker fixes, the tester re-tests"
+  elif ! same_code "$tested" "$head"; then
+    gate_fail "the code changed after the test (tested $(git -C "$WT" rev-parse --short "$tested"), now $(git -C "$WT" rev-parse --short "$head")). Next: tester re-tests"
+  fi
+
+  pair=$(last_round "$NOTES/review.md" 'Reviewed commit:' 'Ship allowed:'); reviewed=${pair%% *}; ship=${pair#* }
+  if [ -z "$reviewed" ]; then
+    gate_fail "no review record: notes/review.md needs 'Reviewed commit: <full commit id>' followed by 'Ship allowed: yes'. Next: codex-reviewer"
+  elif ! full_sha "$reviewed" || ! git -C "$WT" cat-file -e "$reviewed^{commit}" 2>/dev/null; then
+    gate_fail "the review record names '$reviewed', which is not a full commit id of this repo. Next: the codex-reviewer writes the 40-character id it reviewed"
+  elif [ "$ship" != "yes" ]; then
+    gate_fail "the last review round's verdict is 'Ship allowed: ${ship:-missing}'. Next: the worker fixes the defects, then test and review again"
+  elif pr=$(review_pair "$NOTES/review.md") && [ -n "$pr" ]; then
+    gate_fail "$pr"
+  elif ! git -C "$WT" merge-base --is-ancestor "$reviewed" "$head"; then
+    gate_fail "the reviewed commit is no longer in this branch. Next: codex-reviewer, next round"
+  elif ! same_code "$reviewed" "$head"; then
+    # the only change allowed after a review is a clean update from the base branch
+    t=""
+    git -C "$WT" merge-tree --write-tree "$reviewed" "$basesha" >/dev/null 2>&1 && t=$(git -C "$WT" merge-tree --write-tree "$reviewed" "$basesha" 2>/dev/null | head -1)
+    if [ -z "$t" ] || ! same_code "$t" "$head"; then
+      gate_fail "the code changed after the review (reviewed $(git -C "$WT" rev-parse --short "$reviewed")). Next: codex-reviewer, next round"
+    fi
+  fi
+
+  if [ -f "$NOTES/plan.md" ] && [ "$track" != "quick" ]; then
+    story=$(rd_field Story | grep -oE 's[0-9]+[a-z]*-[a-z0-9-]+' | head -1)
+    # only a dated line counts: a placeholder such as "Approved: (pending)" is not the user's approval
+    if ! grep -qE '^Approved: [0-9]{4}-[0-9]{2}-[0-9]{2}' "$NOTES/plan.md" && ! { [ -n "$story" ] && grep -qE '^validated:[[:space:]]*yes' "$WT/docs/plans/$story.md" 2>/dev/null; }; then
+      gate_fail "the plan was never approved (no dated 'Approved: YYYY-MM-DD by ...' line in notes/plan.md, from the user or the decision room). Next: the router has the plan approved"
+    fi
+  fi
+
+  q=$(grep -c '^## Q[0-9][0-9]* \[open\]' "$NOTES/questions.md" 2>/dev/null || true)
+  [ "${q:-0}" = "0" ] || gate_fail "$q open question(s) in notes/questions.md. Next: the router asks the user"
+  [ "$(rd_open_questions)" = "0" ] || gate_fail "open questions in rd.md. Next: the router asks the user"
+
+  [ -z "$GATE_REASONS" ]
+}
+
+cmd_gate() {
+  [ $# -ge 3 ] || die "usage: sa gate <ticket-dir> <worktree> <base> [--allow-stale]"
+  local allow=0
+  [ "${4:-}" = "--allow-stale" ] && allow=1
+  if run_gate "$1" "$2" "$3" "$allow"; then
+    echo "GATE: pass ($ID $SLUG at $(git -C "$WT" rev-parse --short "$GATE_HEAD"): tested, reviewed, up to date with $3)"
+    cmd_selfcheck "$WT" "$GATE_BASE" 2>/dev/null | sed 's/^/note: /' | grep -v 'selfcheck: clean' || true
+  else
+    echo "GATE: fail ($ID $SLUG)"
+    printf '%s' "$GATE_REASONS"
+    return 1
+  fi
+}
+
+cmd_land() {
+  [ $# -ge 3 ] || die "usage: sa land <ticket-dir> <worktree> <base> [--message \"<msg>\"]"
+  local tdir="$1" base="$3" msg="" branch head basesha basewt gd changed dirty overlap tree new merged out clash f
+  [ "${4:-}" = "--message" ] && msg=$(oneline "${5:-}")
+  ROLE_OWN=merger
+  ticket_vars "$tdir"
+  lock "$TICKETS"   # one landing at a time per project
+  if ! run_gate "$tdir" "$2" "$base" 0; then
+    echo "GATE: fail ($ID $SLUG); nothing merged"
+    printf '%s' "$GATE_REASONS"
+    return 1
+  fi
+  head=$GATE_HEAD; basesha=$GATE_BASE   # land exactly the commits the gate checked
+  [ -n "$msg" ] || msg="merge: $ID $SLUG"
+  git -C "$WT" show-ref --verify -q "refs/heads/$base" || die "'$base' is not a local branch; sa land merges locally only (with Delivery: direct-PR the worker opens a PR instead)"
+  [ "$(git -C "$WT" rev-parse "refs/heads/$base")" = "$basesha" ] || die "'$base' does not name the local branch unambiguously; pass the local branch name"
+  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD)
+  [ "$branch" != "HEAD" ] || die "the worktree is on a detached HEAD, not on the ticket branch"
+  [ "$branch" != "$base" ] || die "the worktree is on $base itself; the ticket needs its own branch"
+  # The merge commit is built first: the ticket's tree, on top of the base the gate checked.
+  tree=$(git -C "$WT" rev-parse "$head^{tree}")
+  new=$(git -C "$WT" commit-tree "$tree" -p "$basesha" -p "$head" -m "$msg") || die "could not create the merge commit"
+  basewt=$(git -C "$WT" worktree list --porcelain | awk -v b="refs/heads/$base" '/^worktree /{w=substr($0,10)} /^branch /{ if ($2==b) print w }' | head -1)
+  if [ -n "$basewt" ]; then
+    gd=$(git -C "$basewt" rev-parse --absolute-git-dir)
+    if [ -e "$gd/MERGE_HEAD" ] || [ -e "$gd/CHERRY_PICK_HEAD" ] || [ -e "$gd/REVERT_HEAD" ] || [ -d "$gd/rebase-merge" ] || [ -d "$gd/rebase-apply" ]; then
+      die "the checkout of $base ($basewt) has an unfinished merge, rebase or cherry-pick; the user finishes it first"
+    fi
+    changed=$(git -C "$WT" diff --name-only "$basesha" "$head" | sort)
+    dirty=$( { git -C "$basewt" diff --name-only HEAD; git -C "$basewt" ls-files --others --exclude-standard; } | sort -u)
+    overlap=$(comm -12 <(printf '%s\n' "$changed") <(printf '%s\n' "$dirty") | grep -v '^$' || true)
+    [ -z "$overlap" ] || die "the checkout of $base has uncommitted changes in files this ticket changes: $(printf '%s' "$overlap" | tr '\n' ' '). The user commits or sets them aside first; nothing changed"
+    # A file this ticket adds that is already on disk there belongs to the user, tracked or
+    # not, ignored or not. Names are read NUL-separated so no quoting can hide one.
+    clash=""
+    while IFS= read -r -d '' f; do
+      [ -n "$f" ] || continue
+      if [ -e "$basewt/$f" ] || [ -L "$basewt/$f" ]; then clash="$clash $f"; fi
+    done < <(git -C "$WT" diff -z --no-renames --name-only --diff-filter=A "$basesha" "$head")
+    [ -z "$clash" ] || die "the checkout of $base holds files of the user (untracked, possibly ignored) at paths this ticket adds:$clash. The user moves them away first; nothing changed"
+    # Fast-forward only: if the branch moved since the gate, git refuses and nothing lands.
+    if ! out=$(git -C "$basewt" merge --ff-only --no-squash --no-overwrite-ignore "$new" 2>&1); then
+      die "git refused to move $base to the merged code, so the branch did not move. If $base just got a new commit, run sa land again; otherwise look at that checkout (git -C $basewt status). Git said: $(oneline "$out" | cut -c1-300)"
+    fi
+  else
+    git -C "$WT" update-ref -m "sa land $ID" "refs/heads/$base" "$new" "$basesha" || die "$base moved while merging; nothing changed. Run sa land again"
+  fi
+  merged=$(git -C "$WT" rev-parse "refs/heads/$base")
+  [ "$merged" = "$new" ] || die "$base is not at the merged commit after the merge (a git setting such as a squash option got in the way). Nothing was recorded as landed; look at the checkout of $base (git -C ${basewt:-$WT} status)"
+  { mkdir -p "$NOTES" && own_line "$NOTES/merge.md" && printf 'Landed: %s on %s, %s\n' "$new" "$base" "$(now)" >> "$NOTES/merge.md"; } || echo "note: the landing could not be recorded in notes/merge.md; add the line 'Landed: $new on $base' there"
+  room_log landing "$new on $base"
+  if [ "$(git -C "$WT" rev-parse "$merged^{tree}")" = "$(git -C "$WT" rev-parse "$head^{tree}")" ]; then
+    echo "LANDED: $ID $SLUG merged into $base at $(git -C "$WT" rev-parse --short "$merged"); the merged code is identical to the tested and reviewed code. Not pushed."
+  else
+    echo "LANDED: $ID $SLUG merged into $base at $(git -C "$WT" rev-parse --short "$merged"), but the merged code differs from the tested code; the checker must run the full eval. Not pushed."
+  fi
+}
+
+room_note() {
+  [ $# -ge 3 ] || die "usage: sa room note <ticket-dir | tickets-dir> <who> \"<text>\""
+  if [ -f "${1%/}/rd.md" ]; then ticket_vars "$1"; else tickets_vars "$1"; fi
+  [ -n "$(oneline "$3")" ] || die "empty note"
+  ROLE_NAMED=$2
+  room_find
+  [ -n "$ROOM_LOG" ] || { echo "no decision room for this project; nothing written"; return 0; }
+  lock "$TICKETS"
+  room_log note "$2: $3"
+  [ "$ROOM_OK" = "1" ] && echo "noted"
+  return 0
+}
+
+# sa room event: the interactions sa does not see itself (an agent started or reporting back, a question
+# or an answer written outside sa ask / sa answer), one line each (superagent#005)
+room_event() {
+  [ $# -ge 4 ] || die "usage: sa room event <ticket-dir | tickets-dir> dispatch|report|question|answer <who> \"<text>\""
+  case "$2" in dispatch|report|question|answer) ;; *) die "event kind must be dispatch, report, question or answer (got '$(oneline "$2")')" ;; esac
+  local who text
+  who=$(oneline "$3"); text=$(oneline "$4")
+  [ -n "${who//[[:space:]]/}" ] || die "empty who"
+  [ -n "${text//[[:space:]]/}" ] || die "empty text"
+  ROLE_NAMED=$who
+  # no BOARD.md needed: a new project's first ticket-writer logs before it writes the board
+  local d="${1%/}" name
+  [ -d "$d" ] || die "no such ticket or tickets folder: $d"
+  ROOM_TID=""
+  if [ -f "$d/rd.md" ]; then
+    name=$(basename "$d")
+    case "$name" in [0-9][0-9][0-9]-*) ROOM_TID=${name%%-*} ;; *) die "ticket folder must be named NNN-slug, got '$name'" ;; esac
+    d="$d/.."
+  fi
+  TICKETS=$(cd "$d" && pwd)
+  room_find
+  [ -n "$ROOM_LOG" ] || { echo "no decision room for this project; nothing written"; return 0; }
+  if [ "$2" = dispatch ] && dispatch_claimed "$who"; then echo "logged"; return 0; fi   # the router's hook logged this start
+  lock "$TICKETS"
+  room_log "$2" "$who: $text"
+  [ "$ROOM_OK" = "1" ] && echo "logged"
+  return 0
+}
+
+room_index() {
+  [ $# -ge 1 ] || die "usage: sa room index <workspace>"
+  [ -f "$1/ACTIVE-PROJECTS.md" ] || die "no ACTIVE-PROJECTS.md in '$1' (pass the workspace folder)"
+  local ws out tmp p base t b d n q
+  ws=$(cd "$1" && pwd); out="$ws/decision-room/INDEX.md"; tmp="$out.sa.$$"
+  mkdir -p "$ws/decision-room" || die "could not create $ws/decision-room"
+  {
+    printf '# Decision room index\n\nGenerated: %s by `sa room index`; do not edit, run it again.\n%s\n' "$(now)" "$(badge_legend)"
+    active_projects "$ws" | while IFS=$'\t' read -r p base b; do
+      TICKETS=$(cd "$(dirname "$b")" && pwd); room_find   # normalised as tickets_vars does: the path the writers use
+      q=0
+      for d in "$TICKETS"/[0-9][0-9][0-9]-*/; do
+        [ -f "$d/rd.md" ] || continue
+        RD="$d/rd.md"
+        n=$(grep -c '^## Q[0-9][0-9]* \[open\]' "$d/notes/questions.md" 2>/dev/null || true)
+        q=$(( q + ${n:-0} + $(rd_open_questions) ))
+      done
+      printf '\n## %s\nPath: %s\nLog: %s\nOpen questions: %s\n' "$p" "$base" "${ROOM_LOG:-none}" "$q"
+      awk -F'|' '
+        /^\|[ \t]*[0-9][0-9][0-9][ \t]*\|/ {
+          id=$2; slug=$3; s=$4; gsub(/[ \t]/,"",id); gsub(/^[ \t]+|[ \t]+$/,"",slug); sub(/^[ \t]+/,"",s); split(s,a,/[ \t:(]/)
+          g=(NF>=8)?$7:"-"; gsub(/[ \t]/,"",g); if (g=="") g="-"
+          if (a[1]=="done" || a[1]=="dropped") next
+          print "- " id " " slug ": " a[1] "/" g; k++ }
+        END { if (!k) print "- no open tickets" }' "$b"
+    done
+  } > "$tmp" && replace_file "$tmp" "$out" || { rm -f "$tmp"; die "could not write $out"; }
+  echo "wrote $out"
+}
+
+DECIDE_USAGE='usage: sa room decide <ticket-dir | tickets-dir> <subject> "<question>" --option "<a>" --option "<b>" [--option "<c>"] (--fable <letter> "<reasoning>" | --fable-unavailable "<reason>") (--codex <letter> "<reasoning>" | --codex-unavailable "<reason>") [--seat <name> <letter> "<reasoning>" | --seat-unavailable <name> "<reason>"]... [--evidence <seat> "<text>" | --no-evidence <seat>]... [--steelman <seat> "<best other argument>" "<would change my mind>"]... [--test <letter|none> "<command>" "<result>"] [--referee <model> <letter|unsure> "<why>"] [--safer <letter> "<why>"]'
+LETTERS=abcdefghijklmnopqrstuvwxyz
+
+seat_check() { # seat_check <seat> <kind pos|out|""> <letter> <text> <option count>: refuses an incomplete position
+  [ -n "$2" ] || die "the $1 seat is missing"
+  if [ "$2" = out ]; then [ -n "$4" ] || die "$1 unavailable needs its reason"; return 0; fi
+  case "${LETTERS:0:$5}" in *"$3"*) [ "${#3}" = 1 ] ;; *) false ;; esac ||
+    die "$1's position '$(oneline "$3")' is not one of the options (a-${LETTERS:$(($5 - 1)):1})"
+  [ -n "$4" ] || die "$1's position needs its reasoning"
+}
+# The seats of one decision (superagent#006), parallel arrays since bash 3.2 has no associative ones:
+# name, kind (pos|out), letter, reasoning, evidence, no-evidence mark, best other argument, what would change its mind
+SN=(); SK=(); SL=(); SW=(); SE=(); SX=(); SB=(); SC=(); SI=""
+seat_at() { local i; SI=""; for i in ${SN[@]+"${!SN[@]}"}; do [ "${SN[$i]}" = "$1" ] && { SI=$i; return 0; }; done; return 1; }
+seat_flag() { # seat_flag <flag> <seat>: SI is that seat, which must have a position
+  seat_at "$2" || die "$1 names no seat '$(oneline "$2")'"
+  [ "${SK[$SI]}" = pos ] || die "$2 is unavailable; $1 needs a position"
+}
+seat_label() { case "$1" in fable) echo "$SEAT_FABLE Fable 5.2" ;; codex) echo "$SEAT_CODEX Codex Astra" ;; carbon) echo "$SEAT_CARBON Gemini 4" ;; *) echo "$1" ;; esac; }
+in_list() { local x="$1" y; shift; for y in "$@"; do [ "$x" = "$y" ] && return 0; done; return 1; }
+
+# sa room decide: one decision record in <project room>/DECISIONS.md and one decision line in its LOG.md,
+# both or neither. sa, not the caller, works out the decision and who decided (FR-2 of superagent#002).
+# A call with any vote flag (superagent#006) counts a position only with its evidence; a call without
+# them is decided and recorded exactly as before.
+room_decide() {
+  [ $# -ge 3 ] || die "$DECIDE_USAGE"
+  if [ -f "${1%/}/rd.md" ]; then ticket_vars "$1"; else tickets_vars "$1"; fi
+  local subject q opts=() sl="" sw="" seat flag k l w ext=0 tl="" tc="" tres="" refm="" rl="" rw="" i
+  local pf=() pa=() pb=() pc=()   # per-seat flags, applied once every seat is known
+  SN=(); SK=(); SL=(); SW=(); SE=(); SX=(); SB=(); SC=()
+  subject=$(oneline "$2"); q=$(oneline "$3"); shift 3
+  ROLE_OWN=decision-room
+  while [ $# -gt 0 ]; do
+    flag=$1
+    case "$1" in
+      --option) [ $# -ge 2 ] || die "--option needs its text"; opts+=("$(oneline "$2")"); shift 2 ;;
+      --fable|--codex|--fable-unavailable|--codex-unavailable|--seat|--seat-unavailable)
+        case "$1" in
+          --seat*)
+            [ $# -ge 2 ] || die "$1 needs a seat name"; seat=$2; ext=1
+            [[ "$seat" =~ ^[a-z0-9-]+$ ]] || die "seat name '$(oneline "$seat")' must be lower-case letters, digits or -"
+            k=pos; [ "$1" = --seat ] || k=out; shift 2 ;;
+          *) seat=${1#--}; seat=${seat%-unavailable}; k=pos; [ "$1" = "--$seat" ] || k=out; shift ;;
+        esac
+        ! seat_at "$seat" || die "the $seat seat is given twice"
+        if [ "$k" = pos ]; then
+          [ $# -ge 2 ] || die "$flag needs a letter and its reasoning"; l=$1; w=$(oneline "$2"); shift 2
+        else
+          [ $# -ge 1 ] || die "$flag needs its reason"; l=""; w=$(oneline "$1"); shift
+        fi
+        SN+=("$seat"); SK+=("$k"); SL+=("$l"); SW+=("$w"); SE+=(""); SX+=(0); SB+=(""); SC+=("") ;;
+      --evidence) [ $# -ge 3 ] || die "--evidence needs a seat and its text"; ext=1; pf+=(evidence); pa+=("$2"); pb+=("$(oneline "$3")"); pc+=(""); shift 3 ;;
+      --no-evidence) [ $# -ge 2 ] || die "--no-evidence needs a seat"; ext=1; pf+=(no-evidence); pa+=("$2"); pb+=(""); pc+=(""); shift 2 ;;
+      --steelman) [ $# -ge 4 ] || die "--steelman needs a seat, the best other argument and what would change its mind"
+        ext=1; pf+=(steelman); pa+=("$2"); pb+=("$(oneline "$3")"); pc+=("$(oneline "$4")"); shift 4 ;;
+      --test) [ $# -ge 4 ] || die "--test needs a letter or none, the command and its result"; ext=1
+        [ -z "$tc" ] || die "--test is given twice"
+        tl=$2; tc=$(oneline "$3"); tres=$(oneline "$4"); shift 4
+        [ -n "$tc" ] && [ -n "$tres" ] || die "--test needs a letter or none, the command and its result" ;;
+      --referee) [ $# -ge 4 ] || die "--referee needs a model, a letter or unsure, and why"; ext=1
+        [ -z "$refm" ] || die "--referee is given twice"
+        refm=$(oneline "$2"); rl=$3; rw=$(oneline "$4"); shift 4
+        [ -n "$refm" ] && [ -n "$rl" ] && [ -n "$rw" ] || die "--referee needs a model, a letter or unsure, and why" ;;
+      --safer) [ $# -ge 3 ] || die "--safer needs a letter and why it is the more cautious choice"; sl=$2; sw=$(oneline "$3"); shift 3 ;;
+      *) die "unknown option '$(oneline "$1")'. $DECIDE_USAGE" ;;
+    esac
+  done
+
+  # every check before any write: a record is complete or it is not written
+  [[ "$subject" =~ ^([QS][0-9]+|ready|plan|merge|other)$ ]] || die "subject must be Q<n>, ready, plan, merge, S<n> or other (got '$subject')"
+  [ -n "$q" ] || die "the question is empty"
+  local n_opt=${#opts[@]}
+  [ "$n_opt" -ge 2 ] || die "a decision needs at least two options"
+  [ "$n_opt" -le 26 ] || die "a decision takes at most 26 options"
+  for i in "${!opts[@]}"; do [ -n "${opts[$i]}" ] || die "option ${LETTERS:$i:1} is empty"; done
+  seat_at fable || die "the fable seat is missing"
+  seat_at codex || die "the codex seat is missing"
+  in_list pos "${SK[@]}" || die "no seat is available; this question reaches the user"
+  local ord=()   # the record's order: fable, codex, then any other seat as given
+  seat_at fable; ord+=("$SI"); seat_at codex; ord+=("$SI")
+  for i in "${!SN[@]}"; do in_list "${SN[$i]}" fable codex || ord+=("$i"); done
+  for i in "${ord[@]}"; do seat_check "${SN[$i]}" "${SK[$i]}" "${SL[$i]}" "${SW[$i]}" "$n_opt"; done
+  for i in ${pf[@]+"${!pf[@]}"}; do
+    seat_flag "--${pf[$i]}" "${pa[$i]}"
+    case "${pf[$i]}" in
+      evidence)
+        [ -n "${pb[$i]}" ] || die "--evidence for ${pa[$i]} is empty"
+        [ "${SX[$SI]}" = 0 ] || die "${pa[$i]} has both --evidence and --no-evidence"
+        [ -z "${SE[$SI]}" ] || die "--evidence for ${pa[$i]} is given twice"
+        SE[$SI]=${pb[$i]} ;;
+      no-evidence)
+        [ -z "${SE[$SI]}" ] || die "${pa[$i]} has both --evidence and --no-evidence"
+        [ "${SX[$SI]}" = 0 ] || die "--no-evidence for ${pa[$i]} is given twice"
+        SX[$SI]=1 ;;
+      steelman)
+        [ -n "${pb[$i]}" ] && [ -n "${pc[$i]}" ] || die "--steelman for ${pa[$i]} needs both texts"
+        [ -z "${SB[$SI]}" ] || die "--steelman for ${pa[$i]} is given twice"
+        SB[$SI]=${pb[$i]}; SC[$SI]=${pc[$i]} ;;
+    esac
+  done
+  case "$tl" in ""|none) ;; *) [ "${#tl}" = 1 ] || die "--test needs a letter or none, the command and its result" ;; esac
+
+  # the counting seats: available, and in a call with vote flags, with evidence
+  local cnt=() others=() held=() top=0 topl="" c j
+  for i in "${ord[@]}"; do
+    if [ "${SK[$i]}" = out ]; then others+=("${SN[$i]} unavailable: ${SW[$i]}")
+    elif [ "${SX[$i]}" = 1 ] || { [ "$ext" = 1 ] && [ -z "${SE[$i]}" ]; }; then others+=("${SN[$i]}: no evidence")
+    else cnt+=("$i"); fi
+  done
+  [ "${#cnt[@]}" -gt 0 ] || die "no seat is available; this question reaches the user"
+  for i in "${cnt[@]}"; do
+    c=0; for j in "${cnt[@]}"; do [ "${SL[$j]}" = "${SL[$i]}" ] && c=$((c + 1)); done
+    [ "$c" -gt "$top" ] && { top=$c; topl=${SL[$i]}; }
+    in_list "${SL[$i]}" ${held[@]+"${held[@]}"} || held+=("${SL[$i]}")
+  done
+  local m=${#cnt[@]} dl who hs
+  hs=$(printf '%s, ' "${held[@]}"); hs=${hs%, }
+  if [ "$m" = 1 ] || [ $((top * 2)) -gt "$m" ]; then
+    { [ -n "$tc" ] && [ "$tl" != none ]; } || [ -n "$refm" ] &&
+      die "the seats have a majority ($topl); --test with a letter and --referee are only for seats that differ"
+    dl=$topl
+    if [ "$m" = 1 ]; then j=$(printf '%s; ' "${others[@]}"); who="${SN[${cnt[0]}]} alone (${j%; })"
+    elif [ "$m" = 2 ]; then who=both
+    else who="majority ($top of $m)"; fi
+  elif [ -n "$tc" ] && [ "$tl" != none ]; then
+    in_list "$tl" "${held[@]}" || die "--test must name one of the held positions ($hs)"
+    [ -z "$refm" ] || die "a test settled it ($tl); no --referee"
+    dl=$tl; who="test ($tc)"
+  elif [ -n "$refm" ] && [ "$rl" != unsure ]; then
+    in_list "$rl" "${held[@]}" || die "--referee must name one of the held positions ($hs), or unsure"
+    dl=$rl; who="referee ($refm)"
+  else
+    in_list "$sl" "${held[@]}" && [ -n "$sw" ] || die "the seats differ ($hs); --safer must name one of them, with why"
+    dl=$sl; who="safer-option tie-break ($sw)"
+    [ -z "$refm" ] || who="safer-option tie-break (referee unsure: $rw)"
+  fi
+  local pre=${LETTERS%%"$dl"*} dtext
+  dtext=${opts[${#pre}]}
+  # the record's seat lines, in one printf with the rest (lines a call without vote flags never gets are added only with them)
+  local body=() lab
+  for i in "${ord[@]}"; do
+    lab=$(seat_label "${SN[$i]}")
+    if [ "${SK[$i]}" = out ]; then body+=("$lab: unavailable: ${SW[$i]}"); continue; fi
+    body+=("$lab: ${SL[$i]}: ${SW[$i]}")
+    if [ -n "${SE[$i]}" ]; then body+=("$lab evidence: ${SE[$i]}")
+    elif [ "$ext" = 1 ]; then body+=("$lab evidence: none (position does not count)"); fi
+    [ -z "${SB[$i]}" ] || body+=("$lab best other argument: ${SB[$i]}" "$lab would change my mind: ${SC[$i]}")
+  done
+  if [ -n "$tc" ]; then
+    body+=("Test: $tc" "Test result: $tres")
+    if [ "$tl" = none ]; then body+=("Test settled: nothing"); else body+=("Test settled: ($tl)"); fi
+  fi
+  [ -z "$refm" ] || body+=("Referee ($refm): $rl: $rw")
+  body+=("Decision: ($dl) $dtext" "Decided by: $who")
+  # what stays the user's (superagent#003): a stop, and every question only the user can settle,
+  # checked under the lock, so a stop or a mark that lands while this waits is seen
+  lock "$TICKETS"   # every writer of this room log holds the same lock
+  local st owners
+  if [ -n "${TDIR:-}" ]; then
+    st=$(board_get); st=${st%%|*}
+    if [ "$st" = stopped ] || [ "$(rd_field Status)" = stopped ]; then die "$ID is stopped by the user; the room never lifts a stop"; fi
+    owners=$(owner_open | awk '!seen[$0]++')
+    if [ -n "$owners" ]; then
+      printf '%s\n' "$owners" | grep -qxF "$subject" && die "an access question reaches the user"
+      die "$ID waits for the user's answer to $(printf '%s\n' "$owners" | head -1)"
+    fi
+  fi
+  case "$subject" in S[0-9]*)
+    [ "$(item_kind "$TICKETS/SUGGESTIONS.md" "$subject")" = access ] && die "an access question reaches the user" ;;
+  esac
+  room_find
+  [ -n "$ROOM_LOG" ] || die "no decision room for this project; nothing written"
+
+  local dir f tmp dbak="" lbak="" n bad=""
+  dir=$(dirname "$ROOM_LOG"); f="$dir/DECISIONS.md"; tmp="$f.sa.$$"
+  mkdir -p "$dir" 2>/dev/null && [ -d "$dir" ] || die "could not create the room folder $dir; nothing written"
+  log_lock || die "could not prepare DECISIONS.md; nothing written"   # held to the end: the snapshot and any restore see no other writer
+  n=$(( $(grep -c '^## D[0-9][0-9]*$' "$f" 2>/dev/null || true) + 1 ))
+  local pairs=()   # every option line in one printf, so a failed write of any of them fails the block
+  for i in "${!opts[@]}"; do pairs+=("${LETTERS:$i:1}" "${opts[$i]}"); done
+  if ! {
+      if [ -e "$f" ]; then cat "$f"; else printf '# Decisions: %s\n\nOne block per decision of the decision room, newest last. Written by `sa room decide`; do not edit.\n%s\n' "$ROOM_NAME" "$(badge_legend)"; fi &&
+      printf '\n## D%s\nDate: %s\nTicket: %s\nSubject: %s\nQuestion: %s\nOptions:\n' "$n" "$(now)" "$(room_ref)" "$subject" "$q" &&
+      printf '(%s) %s\n' "${pairs[@]}" &&
+      printf '%s\n' "${body[@]}"
+    } > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; die "could not prepare DECISIONS.md; nothing written"
+  fi
+  # snapshots, so a failed or half-written log line can be taken back together with the record
+  if [ -e "$f" ]; then dbak="$f.bak.sa.$$"; command cp -p "$f" "$dbak" 2>/dev/null || { rm -f "$tmp" "$dbak"; die "could not prepare DECISIONS.md; nothing written"; }; fi
+  if [ -e "$ROOM_LOG" ]; then lbak="$ROOM_LOG.bak.sa.$$"; command cp -p "$ROOM_LOG" "$lbak" 2>/dev/null || { rm -f "$tmp" "$dbak" "$lbak"; die "could not prepare DECISIONS.md; nothing written"; }; fi
+  replace_file "$tmp" "$f" 2>/dev/null || { rm -f "$tmp" "$dbak" "$lbak"; die "could not write DECISIONS.md; nothing written"; }
+  room_log decision "D$n ($subject): $q -> ($dl) $dtext; decided by $who"
+  if [ "$ROOM_OK" != "1" ]; then
+    if [ -n "$dbak" ]; then replace_file "$dbak" "$f" 2>/dev/null || bad="$dbak"; else rm -f "$f" 2>/dev/null || bad="$f"; fi
+    if [ -n "$lbak" ]; then replace_file "$lbak" "$ROOM_LOG" 2>/dev/null || bad="$bad $lbak"; else rm -f "$ROOM_LOG" 2>/dev/null; fi
+    [ -z "$bad" ] || die "could not write the decision-room log, and could not put the records back; their previous content is in: $bad"
+    die "could not write the decision-room log; the decision was not recorded"
+  fi
+  rm -f "$dbak" "$lbak"
+  echo "D$n: ($dl) $dtext; decided by $who"
+}
+
+# --- what only the user can settle, the switch, and the PR guard (superagent#003) ---
+
+item_kind() { # item_kind <file> <Qn|Sn>: "access" or "open" for an open item, nothing when it is not open
+  [ -f "$1" ] || return 0
+  SA_H="## $2 [open]" awk '$0 == ENVIRON["SA_H"] { f=1; k="open"; next } /^## / { f=0 } f && $0 == "Kind: access" { k="access" } END { if (k) print k }' "$1"
+}
+owner_open() { # the open questions of this ticket that only the user can settle, one id per line
+  [ -f "$NOTES/questions.md" ] && awk '/^## Q[0-9]+ \[open\]$/ { id=$2; next } /^## / { id="" } id && $0 == "Kind: access" { print id; id="" }' "$NOTES/questions.md"
+  awk '/^## Open questions/ { f=1; next } /^## / { f=0 } f && /\(access\)[ \t\r]*$/ && match($0, /Q[0-9]+/) { print substr($0, RSTART, RLENGTH) }' "$RD"
+}
+
+draft_kind() { # draft_kind <Qn>: "access" or "open" for the line "- **Qn**: ..." under rd.md's Open questions, nothing when absent
+  SA_RE="^- (\\*\\*)?$1[^0-9]" awk '/^## Open questions/ { f=1; next } /^## / { f=0 }
+    f && $0 ~ ENVIRON["SA_RE"] { print (/\(access\)[ \t\r]*$/ ? "access" : "open"); exit }' "$RD"
+}
+room_owner() { # mark an open question or suggestion as one only the user can settle
+  [ $# -ge 3 ] || die "usage: sa room owner <ticket-dir> <Qn> \"<why>\" | sa room owner <tickets-dir> <Sn> \"<why>\""
+  local id="$2" why f what tmp k
+  why=$(oneline "$3")
+  [ -n "${why//[[:space:]]/}" ] || die "room owner needs the reason (what was tried, or why only the user can settle it)"
+  case "$id" in
+    Q[0-9]*) ticket_vars "$1"; f="$NOTES/questions.md"; what=question ;;
+    S[0-9]*) tickets_vars "$1"; f="$TICKETS/SUGGESTIONS.md"; what=suggestion ;;
+    *) die "mark a question Q<n> (in a ticket folder) or a suggestion S<n> (in a tickets folder), got '$id'" ;;
+  esac
+  [[ "$id" =~ ^[QS][0-9]+$ ]] || die "mark a question Q<n> or a suggestion S<n>, got '$id'"
+  lock "$TICKETS"
+  k=$(item_kind "$f" "$id")
+  if [ -z "$k" ] && [ "$what" = question ]; then k=$(draft_kind "$id"); [ -z "$k" ] || f=$RD; fi   # a draft's question lives in rd.md
+  [ -n "$k" ] || die "no open $what $id"
+  [ "$k" != access ] || die "$id is already marked as the user's"
+  tmp="$f.sa.$$"
+  if [ "$f" = "${RD:-}" ]; then   # the draft's line gets the (access) ending; the reason goes to the room log
+    SA_RE="^- (\\*\\*)?$id[^0-9]" awk '
+      /^## Open questions/ { f=1; print; next }
+      /^## / { f=0 }
+      f && !done && $0 ~ ENVIRON["SA_RE"] { sub(/[ \t\r]+$/, ""); print $0 " (access)"; done=1; next }
+      { print }' "$f" > "$tmp"
+  else
+    SA_H="## $id [open]" SA_W="$why" awk '
+      $0 == ENVIRON["SA_H"] { f=1; print; next }
+      /^## / { f=0 }
+      { print }
+      f && /^(Question|Idea):/ { print "Kind: access"; print "Tried: " ENVIRON["SA_W"]; f=0 }' "$f" > "$tmp"
+  fi && replace_file "$tmp" "$f" || { rm -f "$tmp"; die "could not write $(basename "$f")"; }
+  room_log note "$id marked as the user's: $why"
+  echo "$id marked as the user's; it reaches the user"
+}
+
+SWITCH_OLD='user approvals are never skipped'
+SWITCH_NEW='what only the user can give (logins, access, their own stop orders) is never skipped'
+room_set() { # room_set on|off <dir> <date> <text> [<tickets-dir>...]: rewrite the switch, then note it in every room log
+  local w=$1 dir=$2 day=$3 text=$4 P tmp from to line note
+  shift 4
+  P="$dir/ROUTER-PREFS.md"; tmp="$P.sa.$$"
+  if [ "$w" = on ]; then
+    from=$SWITCH_OLD; to=$SWITCH_NEW; line="- $day: \"$text\". Standing rule: Decision room: on."
+    note="decision room switched on (the user's standing order of $day)"
+  else
+    from=$SWITCH_NEW; to=$SWITCH_OLD
+    line="- $day: \"$text\". Standing rule: Decision room: off. The decision room has no authority; every decision goes to the owner, whatever other lines of this file say."
+    note="decision room switched off: $text"
+  fi
+  [ ! -e "$P" ] || [ -f "$P" ] || die "$P is not a file; nothing changed"
+  lock "$dir"
+  [ -f "$P" ] && { command cp -p "$P" "$tmp" 2>/dev/null || die "could not read $P; nothing changed"; }
+  # only an unquoted phrase is the rule; a line quoting it (the "replaces the earlier" note) stays as it is
+  if ! { if [ -f "$P" ]; then SA_F="$from" SA_T="$to" LC_ALL=C awk '
+          BEGIN { f = ENVIRON["SA_F"]; t = ENVIRON["SA_T"] }
+          { out = ""; s = $0
+            while ((i = index(s, f)) > 0) {
+              prev = (i > 1) ? substr(s, i - 1, 1) : substr(out, length(out), 1)
+              out = out substr(s, 1, i - 1) ((prev == "\"") ? f : t); s = substr(s, i + length(f))
+            }
+            print out s }' "$P"
+        else printf '# Router preferences\n\n'; fi; } > "$tmp" || ! own_line "$tmp" || ! printf '%s\n' "$line" >> "$tmp"; then
+    rm -f "$tmp"; die "could not prepare $P; nothing changed"
+  fi
+  replace_file "$tmp" "$P" || { rm -f "$tmp"; die "could not write $P; nothing changed"; }
+  unlock; LOCKDIR=""; trap - EXIT   # the switch is written; each note takes its own project's lock
+  echo "switch: $(room_switch "$P") ($P)"
+  switch_notes "$dir" "$note" "$@"
+}
+switch_notes() { # switch_notes <dir> <note> [<tickets-dir>...]: one note per project; 1 when one is missing
+  local dir=$1 text=$2 p base t n tk out seen="|" bad=0 list=()
+  shift 2
+  if [ -f "$dir/ACTIVE-PROJECTS.md" ]; then
+    while IFS= read -r p; do
+      case "$p" in /*) base="$p" ;; *) base="$dir/$p" ;; esac
+      for t in tickets spec/tickets specs/tickets docs/tickets; do for n in BOARD.md board.md; do
+        [ -f "$base/$t/$n" ] && { list+=("$base/$t"); break 2; }
+      done; done
+    done < <(sed -n 's/^- \[[ xX]\] \([^ ]*\).*/\1/p' "$dir/ACTIVE-PROJECTS.md")
+  fi
+  list+=("$@")
+  for tk in ${list[@]+"${list[@]}"}; do
+    p=$(cd "$tk" 2>/dev/null && pwd) || { echo "note: no switch note for $tk (no such folder)"; bad=1; continue; }
+    case "$seen" in *"|$p|"*) continue ;; esac
+    seen="$seen$p|"
+    out=$( LOCKDIR=""; tickets_vars "$p"; room_find; [ -n "$ROOM_LOG" ] || exit 0
+           lock "$TICKETS"; room_log note "$text" >/dev/null; [ "$ROOM_OK" = 1 ] || { echo "$ROOM_NAME"; exit 1; } ) && continue
+    bad=1
+    case "$out" in refused:*) echo "note: no switch note for $p ($out)" ;; *) echo "note: no switch note for $(printf '%s\n' "$out" | tail -1)" ;; esac
+  done
+  return "$bad"
+}
+room_on() {
+  [ $# -ge 3 ] || die "usage: sa room on <workspace> <YYYY-MM-DD> \"<the user's words>\" [<tickets-dir>...]"
+  [ -d "$1" ] || die "no such folder: $1"
+  [[ "$2" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "the date must be YYYY-MM-DD, got '$(oneline "$2")'"
+  local dir day=$2 words
+  dir=$(cd "$1" && pwd); words=$(oneline "$3")
+  [ -n "${words//[[:space:]]/}" ] || die "the user's words are empty"
+  case "$words" in *"Decision room:"*) die "the words must not contain 'Decision room:'" ;; esac
+  shift 3
+  room_set on "$dir" "$day" "$words" "$@"
+}
+room_off() {
+  [ $# -ge 2 ] || die "usage: sa room off <workspace> \"<why>\" [<tickets-dir>...]"
+  [ -d "$1" ] || die "no such folder: $1"
+  local dir why
+  dir=$(cd "$1" && pwd); why=$(oneline "$2")
+  [ -n "${why//[[:space:]]/}" ] || die "room off needs the reason"
+  case "$why" in *"Decision room:"*) die "the reason must not contain 'Decision room:'" ;; esac
+  shift 2
+  room_set off "$dir" "$(today)" "$why" "$@"
+}
+room_status() {
+  [ $# -ge 1 ] || die "usage: sa room status <workspace, or any folder under it>"
+  [ -d "$1" ] || die "no such folder: $1"
+  local d=${1%/} ws room f
+  # A folder that is not the workspace itself answers for its workspace: on 2026-11-15 a clerk asked
+  # with a project path, read "off", and refused to carry out a room decision.
+  if [ ! -f "$d/ACTIVE-PROJECTS.md" ] && [ ! -f "$d/ROUTER-PREFS.md" ]; then
+    ws=$(hook_ws "$(cd "$d" && pwd)")
+    if [ -n "$ws" ]; then d=$ws
+    else   # a Room: project outside any workspace: the switch sits beside its room folder
+      for f in "$d/PROJECT.md" "$d/tickets/PROJECT.md"; do
+        room=$(sed -n 's/^Room:[[:space:]]*//p' "$f" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')
+        case "$room" in /*) d=$(dirname "$room"); break ;; esac
+      done
+    fi
+  fi
+  room_switch "$d/ROUTER-PREFS.md"
+}
+
+# sa room context: what a decision needs from the room, in place of the whole LOG.md and DECISIONS.md.
+# Those two hold every ticket of the project and grow every day; both seats read them on every
+# decision (about 45k tokens for studio-app on 2026-11-15, most of it about other tickets). The digest
+# holds this ticket's log lines, the project's own lines, this ticket's earlier decisions (the newest
+# in full), its open questions and the paths of its files. The owner's rule of 2026-11-15. Reads only.
+ROOM_CTX_LINES=40    # log lines of the ticket shown, the newest
+ROOM_CTX_PROJECT=10  # the project's own lines shown, the newest
+ROOM_CTX_FULL=2      # earlier decisions printed whole, the newest; older ones get one line each
+ROOM_CTX_WIDTH=300   # a longer line is cut and marked [cut]; the whole line stays in LOG.md
+room_ctx_lines() { # room_ctx_lines <LOG.md> <ref> <title> <how many>: the lines whose ref is exactly <ref>
+  printf '\n## %s' "$3"
+  [ -f "$1" ] || { printf ' (0)\nnone\n'; return 0; }
+  awk -v ref="$2" -v max="$4" -v w="$ROOM_CTX_WIDTH" '
+    /^# / { next }
+    { i = index($0, " | "); if (!i) next
+      rest = substr($0, i + 3); j = index(rest, " | "); if (!j) next
+      if (substr(rest, 1, j - 1) == ref) l[++n] = $0 }
+    END {
+      printf " (%d%s)\n", n, (n > max ? ", the last " max " shown" : "")
+      if (!n) print "none"
+      for (k = (n > max ? n - max + 1 : 1); k <= n; k++) {
+        s = l[k]; if (length(s) > w) s = substr(s, 1, w) " [cut]"
+        print s } }' "$1"
+}
+room_ctx_decisions() { # room_ctx_decisions <DECISIONS.md> <ref>: the "## D<n>" blocks whose Ticket: is <ref>
+  [ -f "$1" ] || { printf '\n## Earlier decisions on %s (0)\nnone\n' "$2"; return 0; }
+  awk -v ref="$2" -v full="$ROOM_CTX_FULL" -v w="$ROOM_CTX_WIDTH" '
+    function flush() {
+      if (cur != "" && mine) { blk[++n] = cur; one[n] = id " " date " (" subj "): " q " -> " decn "; decided by " by }
+      cur = ""; mine = 0 }
+    /^## D[0-9]+/ { flush(); id = substr($0, 4); cur = "#" $0; date = subj = q = decn = by = ""; next }
+    cur == "" { next }
+    { cur = cur "\n" $0 }
+    /^Ticket: /     { if (substr($0, 9) == ref) mine = 1 }
+    /^Date: /       { date = substr($0, 7) }
+    /^Subject: /    { subj = substr($0, 10) }
+    /^Question: /   { q = substr($0, 11) }
+    /^Decision: /   { decn = substr($0, 11) }
+    /^Decided by: / { by = substr($0, 13) }
+    END {
+      flush()
+      printf "\n## Earlier decisions on %s (%d%s)\n", ref, n, (n > full ? "; the newest " full " in full" : "")
+      if (!n) print "none"
+      for (k = 1; k <= n; k++) {
+        if (k > n - full) { print ""; print blk[k]; continue }
+        s = one[k]; if (length(s) > w) s = substr(s, 1, w) " [cut]"
+        print "- " s } }' "$1"
+}
+# --- the reading set of one question: sa room context <dir> <subject> (superagent#033) ---
+# Everything the seats read by default for one decision, besides rd.md and eval.md: the ticket's newest log lines,
+# the project's notes, the decisions in force, the open questions, and each note in the form the subject needs:
+# listed to read whole, printed cut to its newest round, or listed as left out. Reads only: no lock, no file written.
+ROOM_SET_LINES=30   # the ticket's newest log lines in a reading set; dispatch lines are left out
+fsize() { wc -c < "$1" | tr -d ' '; }
+room_set_lines() { # room_set_lines <LOG.md> <ref> <title> <max, 0: all> <ticket|notes|nonotes>
+  # ticket: no dispatch lines. nonotes: every kind but notes. notes: the note lines only, and of the room-switch notes only the last one.
+  # The count is printed only when lines are capped, so a new line never adds a digit to an uncapped heading.
+  printf '\n## %s' "$3"
+  [ -f "$1" ] || { printf '\nnone\n'; return 0; }
+  awk -v ref="$2" -v max="$4" -v mode="$5" -v w="$ROOM_CTX_WIDTH" '
+    /^# / { next }
+    { i = index($0, " | "); if (!i) next
+      rest = substr($0, i + 3); j = index(rest, " | "); if (!j) next
+      if (substr(rest, 1, j - 1) != ref) next
+      rest = substr(rest, j + 3); j = index(rest, " | "); if (!j) next
+      kind = substr(rest, 1, j - 1); text = substr(rest, j + 3)
+      if (mode == "ticket" && kind == "dispatch") next
+      if (mode == "nonotes" && kind == "note") next
+      if (mode == "notes") { if (kind != "note") next
+        if (text ~ /^([a-z-]+: )?decision room switched o/) { if (sw) drop[sw] = 1; sw = n + 1 } }
+      l[++n] = $0 }
+    END {
+      for (k = 1; k <= n; k++) if (!drop[k]) m++
+      first = (max > 0 && m > max) ? m - max + 1 : 1
+      printf "%s\n", (first > 1 ? " (the last " max " of " m ")" : "")
+      if (!m) print "none"
+      for (k = 1; k <= n; k++) { if (drop[k]) continue; if (++c < first) continue
+        s = l[k]; if (length(s) > w) s = substr(s, 1, w) " [cut]"; print s } }' "$1"
+}
+room_set_decisions() { # room_set_decisions <DECISIONS.md> <ref> <subject, or "" for one line each> <title>
+  # every "## D<n>" block whose Ticket: is <ref>: in full when its Subject: is <subject>, else one line. No cap.
+  [ -f "$1" ] || { printf '\n## %s (0)\nnone\n' "$4"; return 0; }
+  awk -v ref="$2" -v subj="$3" -v title="$4" -v w="$ROOM_CTX_WIDTH" '
+    function flush() {
+      if (cur != "" && mine) { n++; if (subj != "" && s == subj) full[n] = cur; else one[n] = id " " date " (" s "): " q " -> " decn "; decided by " by }
+      cur = ""; mine = 0 }
+    /^## D[0-9]+/ { flush(); id = substr($0, 4); cur = "#" $0; date = s = q = decn = by = ""; next }
+    cur == "" { next }
+    { cur = cur "\n" $0 }
+    /^Ticket: /     { if (substr($0, 9) == ref) mine = 1 }
+    /^Date: /       { date = substr($0, 7) }
+    /^Subject: /    { s = substr($0, 10) }
+    /^Question: /   { q = substr($0, 11) }
+    /^Decision: /   { decn = substr($0, 11) }
+    /^Decided by: / { by = substr($0, 13) }
+    END {
+      flush()
+      printf "\n## %s (%d%s)\n", title, n, (subj != "" ? "; those on " subj " in full" : "")
+      if (!n) print "none"
+      for (k = 1; k <= n; k++) {
+        if (k in full) { print ""; print full[k]; continue }
+        t = one[k]; if (length(t) > w) t = substr(t, 1, w) " [cut]"
+        print "- " t } }' "$1"
+}
+room_set_rounds() { # room_set_rounds <file> <name in the heading>: the note cut to what is still open; exit 3: no round line
+  # The newest round is printed whole. An earlier round keeps every line, prose included, except rows proved
+  # closed or passed (the owner chose the safe side, 2026-11-19):
+  #  - a findings row (table headed "#", no fixed/closed/status column) closed by a later status row that is exactly
+  #    fixed/closed/resolved and names it without doubt: its table names an earlier round, its number cannot be a
+  #    fresh row index, and that round holds exactly one findings row with the number (or exactly one status row
+  #    with it, whose own finding is then meant). No other round is searched. A later "not fixed" reopens it;
+  #  - a blocking findings row (must-fix; defect of severity blocker or major) once a later round is complete and
+  #    passing as the gate reads one (review_pair, review_blocks); an override block never counts;
+  #  - a status row whose finding is named without doubt and is closed;
+  #  - a requirement row whose Met cell is exactly "yes";
+  #  - a test row once a later round has a row with the same Check cell whose result is exactly "pass".
+  # Every closed finding stays named in one line. No round is left out as a whole.
+  awk -v rel="$2" -v path="$1" -v bytes="$(fsize "$1")" '
+    function trim(s) { gsub(/^[ \t*`]+|[ \t*`\r]+$/, "", s); return s }
+    function norm(s) { s = tolower(trim(s)); sub(/\.$/, "", s); s = trim(s); gsub(/[ \t]+/, " ", s); return s }
+    function cells(s,   n) { gsub(/\\\|/, "\001", s); n = split(s, C, "|"); return n }
+    function lead(s) { s = trim(s); return match(s, /^[0-9]+/) ? substr(s, 1, RLENGTH) + 0 : "" }
+    function phys(n) { return (n && dc[n] == 1) ? dp[n] : 0 }   # the one round written with number n; none when 0 or 2+
+    function rnum(s,   t) { t = tolower(s); if (!match(t, /round[- ]?[0-9]+/)) return 0; t = substr(t, RSTART, RLENGTH); gsub(/[^0-9]/, "", t); return t + 0 }
+    function isrun(tb,   x) { for (x = 1; x <= sn[tb]; x++) if (!((tb, x) in sset)) return 0; return 1 }
+    function fits(tb, k,   x, m, ok) { m = sn[tb]
+      if (nfn[k] == m) { ok = 1; for (x = 1; x <= m; x++) if (!((k, x) in fcnt)) ok = 0; if (ok) return 1 }
+      if (ndn[k] == m) { ok = 1; for (x = 1; x <= m; x++) if (!((k, x) in dcnt)) ok = 0; if (ok) return 1 }
+      return 0 }
+    function trusted(k,   tb) { tb = tab[k]
+      if (!tnamed[tb] || tnamed[tb] >= tround[tb] || sref[k] == "") return 0
+      if (sorig[k]) return 1
+      if (!(tb in tr)) tr[tb] = (!isrun(tb) || fits(tb, tnamed[tb]))
+      return tr[tb] }
+    function show(s, k) { if (!FN[k] && s ~ /^## /) s = "#" s; print s }   # a heading of the note stays below the headings of the set
+    function emit(s, k) { if (s ~ /^[ \t\r]*$/) { if (blank) return; blank = 1 } else blank = 0; show(s, k) }
+    function fenceline(s,   i, w, c, ctr) { # after any indent, quote or list markers, 3 or more ` or ~: sets fch, flen,
+      # (BSD awk: substr counts bytes, so a single char is only compared with ==, never matched by a regex)
+      # frest (what follows) and fstrict (a plain CommonMark fence line: up to 3 spaces and no marker before it)
+      i = 1; w = ctr = 0
+      while (1) { c = substr(s, i, 1)
+        if (c == " ") { w++; i++ } else if (c == "\t") { w += 4; i++ } else if (c == ">") { ctr = 1; i++ }
+        else if ((c == "-" || c == "*" || c == "+") && (substr(s, i + 1, 1) == " " || substr(s, i + 1, 1) == "\t")) { ctr = 1; i++ }
+        else if (c != "" && index("0123456789", c) && match(substr(s, i), /^[0-9]+[.)][ \t]/)) { ctr = 1; i += RLENGTH - 1 }
+        else break }
+      fch = substr(s, i, 1); if (fch != "`" && fch != "~") return 0
+      flen = 0; while (substr(s, i + flen, 1) == fch) flen++
+      frest = substr(s, i + flen); fstrict = (!ctr && w <= 3); return flen >= 3 }
+    function code(s,   f) { # 1: a fence line, a line inside a fence, or indented code; an unclosed fence runs to the end.
+      # A fence marker inside a list item or a quote, or indented 4 or more, is read as a fence too, but the reading is
+      # unsure: amb is set, and the rest of the round then closes nothing (when unsure, keep the finding).
+      f = fenceline(s)
+      if (ofc != "") {
+        if (f && fch == ofc && flen >= ofl && frest ~ /^[ \t\r]*$/ && (fstrict || !ostr)) { ofc = ""; if (!fstrict) amb = 1 }   # a top-level fence closes only on a top-level marker
+        else if (f && !fstrict) amb = 1
+        return 1 }
+      if (f && !(fch == "`" && index(frest, "`"))) { ofc = fch; ofl = flen; ostr = fstrict; if (!fstrict) amb = 1; return 1 }
+      if (f && !fstrict) amb = 1
+      return (s ~ /^(    |\t| \t|  \t|   \t)/) }   # every line indented 4 or more is code here, even a list continuation
+    { L[NR] = $0; FN[NR] = code($0) }   # code is printed, never read as a round or a heading, and never closes anything
+    !FN[NR] && /^--- Round [0-9]+/ { r++; start[r] = NR; who[r] = tolower($0); nb[r] = 1; ov = 0; dn[r] = $3 + 0; dc[dn[r]]++; dp[dn[r]] = r; amb = 0 }
+    { Q[NR] = ($0 ~ /^[ \t]*>/); CD[NR] = FN[NR] || amb || Q[NR]; if (amb && r) ambr[r] = 1 }   # CD: may hold only negative evidence
+    r && CD[NR] { x = $0; sub(/^[ \t>]*/, "", x); lx = tolower(x)   # code, a quote, or after an unsure fence: only what keeps counts
+      if (x ~ /^(Ship allowed|Plan sound):/) { sub(/^[^:]*:[ \t]*/, "", lx); gsub(/[ \t\r]+$/, "", lx); if (lx != "yes") bad[r] = 1 }
+      if (x ~ /^--- (User|Decision room) override/) { amb = 1; ambr[r] = 1 } }
+    r && !CD[NR] && /^--- (User|Decision room) override(,|[ \t\r]*$)/ { ov = 1 }
+    r && !ov && !CD[NR] {
+      low = tolower($0)
+      if (low ~ /^second review/) { who[r] = who[r] " " low; nb[r]++ }
+      if ($0 ~ /^(Ship allowed|Plan sound):/) { v = low; sub(/^[^:]*:[ \t]*/, "", v); gsub(/[ \t\r]+$/, "", v); nv[r, nb[r]]++; if (v != "yes") bad[r] = 1; if ($0 ~ /^Ship/) ship[r] = 1 }
+      if (index($0, "Reviewed commit:") == 1) { x = $0; sub(/^[^:]*:[ \t]*/, "", x); gsub(/[ \t\r]+$/, "", x)
+        if (length(x) != 40 || x ~ /[^0-9a-f]/ || (cmt[r] != "" && x != cmt[r])) bad[r] = 1; cmt[r] = x; nc[r, nb[r]]++ } }
+    END {
+      if (!r) exit 3
+      start[r + 1] = NR + 1
+      for (i = 1; i <= r; i++) { p = (who[i] ~ /codex/ && who[i] ~ /claude/ && !bad[i] && !ambr[i])
+        for (b = 1; b <= nb[i]; b++) if (!nv[i, b] || (ship[i] && !nc[i, b])) p = 0
+        pass[i] = p }
+      for (i = 1; i <= r; i++) { intab = 0; hd = ""   # every table row: its kind and what it says
+        for (k = start[i]; k < start[i + 1]; k++) { s = L[k]; if (Q[k]) sub(/^[ \t]*(>[ \t]?)+/, "", s)   # a quoted table is read for what keeps
+          if (s !~ /^[ \t]*\|/) { if (intab) hd = ""; intab = 0; if (s ~ /^#+[ \t]/) { hd = s; hdcd = CD[k] } continue }   # a heading in code names a table that can only keep
+          n = cells(s)
+          if (!intab) { intab = 1; tb++; T[k] = "hdr"; tab[k] = tb; type = "other"; cc = sc = rc = mc = stc = 0
+            tcd[tb] = CD[k] || (hd != "" && hdcd)
+            first = norm(C[2])
+            for (j = 2; j <= n; j++) { c = norm(C[j])
+              if (c ~ /^class/) cc = j; if (c ~ /^severity/) sc = j; if (c == "result") rc = j; if (c == "met") mc = j
+              if (j > 2 && !stc && c ~ /fixed|closed|status/) stc = j }
+            if (first == "#") { type = stc ? "status" : "find"; if (stc) { tnamed[tb] = phys(rnum(s) ? rnum(s) : rnum(hd)); tround[tb] = i } }
+            else if (first == "check" && rc) type = "test"
+            else if (first == "fr" && mc) type = "req"
+            continue }
+          tab[k] = tb
+          if (s ~ /^[ \t]*\|[ \t:|-]+$/) { T[k] = "sep"; continue }
+          T[k] = type; R[k] = i; rows[tb]++; RC[k] = CD[k] || tcd[tb]
+          if (RC[k] && type != "status") { T[k] = "code"; continue }   # never a finding, a pass or a met requirement; never left out
+          if (type == "find") { num[k] = lead(C[2]); cl = cc ? norm(C[cc]) : ""; sv = sc ? norm(C[sc]) : ""
+            label[k] = (cl == "" ? "no class" : cl) (sv != "" ? ", " sv : "")
+            blocking[k] = (cl == "must-fix" || (cl == "defect" && (sv == "blocker" || sv == "major")))
+            if (num[k] != "") { N = num[k]; if (!((i, N) in fcnt)) nfn[i]++; fcnt[i, N]++; frow[i, N] = k
+              if (cl == "defect" || cl == "must-fix") { if (!((i, N) in dcnt)) ndn[i]++; dcnt[i, N]++ } } }
+          else if (type == "status") { orig = ""
+            for (j = 3; j < stc; j++) { c = trim(C[j]); if (match(c, /^[0-9]+[ \t]*(—|–|-)[ \t]/)) { orig = lead(c); break } }
+            spos[k] = (norm(C[stc]) ~ /^(fixed|closed|resolved)$/)
+            if (orig != "") { sref[k] = orig; sorig[k] = 1 }
+            else { sref[k] = lead(C[2]); if (sref[k] != "") { if (!((tb, sref[k]) in sset)) sn[tb]++; sset[tb, sref[k]] = 1 } } }
+          else if (type == "test") { tk[k] = norm(C[2]); if (norm(C[rc]) ~ /^pass(ed)?$/) passed[tk[k]] = i }
+          else if (type == "req") met[k] = (norm(C[mc]) == "yes") } }
+      for (k = 1; k <= NR; k++) if (T[k] == "status") { j = R[k]; tgt = 0   # what each status row names, in file order
+        if (trusted(k)) { nm = tnamed[tab[k]]; N = sref[k]
+          if ((nm, N) in fcnt) { if (fcnt[nm, N] == 1) tgt = frow[nm, N] }
+          else if (scnt[nm, N] == 1 && starget[srow[nm, N]]) tgt = starget[srow[nm, N]] }
+        starget[k] = tgt
+        if (sref[k] != "") { scnt[j, sref[k]]++; srow[j, sref[k]] = k }
+        if (tgt) { if (spos[k]) { if (!RC[k] && j > lastpos[tgt]) lastpos[tgt] = j } else if (j > lastneg[tgt]) lastneg[tgt] = j } }   # a status row in code never closes; one that is not a fix always keeps
+      for (k = 1; k <= NR; k++) if (T[k] == "find") { e = lastpos[k] + 0; h = "status rows"
+        if (blocking[k]) for (j = r; j > R[k]; j--) if (pass[j]) { if (j > e) { e = j; h = "passing verdicts" } break }
+        if (e > 0 && e > lastneg[k] + 0) { closed[k] = e; how[k] = h } }
+      printf "\n## %s: round %d of %d whole%s: %s (%s bytes)\n", rel, r, r, (r > 1 ? "; earlier rounds without what is closed" : ""), path, bytes
+      for (k = 1; k < start[1]; k++) emit(L[k], k)
+      for (i = 1; i < r; i++) {
+        for (k = start[i]; k < start[i + 1]; k++) { t = T[k]; d = 0
+          if (t == "find") d = (closed[k] > 0)
+          else if (t == "status") d = (!RC[k] && starget[k] && closed[starget[k]] > 0)
+          else if (t == "req") d = met[k]
+          else if (t == "test") d = (passed[tk[k]] > i)
+          drop[k] = d; if (d) gone[tab[k]]++ }
+        stub = ""
+        for (k = start[i]; k < start[i + 1]; k++) { t = T[k]
+          if ((t == "hdr" || t == "sep") && rows[tab[k]] && gone[tab[k]] == rows[tab[k]]) continue
+          if (drop[k]) { if (t == "find") stub = stub sprintf("- #%s (%s): closed by round %d, %s\n", num[k], label[k], dn[closed[k]], how[k]); continue }
+          emit(L[k], k) }
+        if (stub != "") { emit("Closed findings of round " dn[i] ", left out:"); printf "%s", stub; blank = 0; emit("") } }
+      for (k = start[r]; k <= NR; k++) show(L[k], k) }' "$1"
+}
+room_set_form() { # room_set_form <row: plan|merge|ready> <note>: whole | rounds | open | out (the table of agents/decision-room.md)
+  case "$1:$2" in
+    *:questions) echo open ;;
+    plan:plan|merge:results|merge:review-response|merge:check) echo whole ;;
+    plan:plan-review|merge:test|merge:review|ready:test|ready:review|ready:plan-review) echo rounds ;;
+    *) echo out ;;
+  esac
+}
+room_ctx_questions() { # room_ctx_questions <ticket dir>: its open questions, whole blocks, with their access marks
+  [ -f "$1/notes/questions.md" ] && awk '
+    /^## Q[0-9]+ \[/ { f = ($0 ~ /\[open\]/) }
+    f { sub(/^## /, "### "); print }' "$1/notes/questions.md"
+  awk '/^## Open questions/ { f = 1; next } /^## / { f = 0 } f && NF && !/^[-* \t]*None\.?[ \t]*$/' "$1/rd.md"
+}
+room_reading_set() { # room_reading_set <ticket-dir | tickets-dir> <subject>
+  local d="${1%/}" subject="$2" name="" tdir="" ref pref dec="" row="" stage="" f form body rc q whole="" out=""
+  [[ "$subject" =~ ^(Q[0-9]+|S[0-9]+|ready|plan|merge|other)$ ]] || die "the subject must be Q<n>, ready, plan, merge, S<n> or other, got '$(oneline "$subject")'"
+  [ -d "$d" ] || die "no such ticket or tickets folder: $d"
+  ROOM_TID=""
+  if [ -f "$d/rd.md" ]; then
+    name=$(basename "$d")
+    case "$name" in [0-9][0-9][0-9]-*) ROOM_TID=${name%%-*} ;; *) die "ticket folder must be named NNN-slug, got '$name'" ;; esac
+    tdir=$(cd "$d" && pwd); d="$d/.."
+  elif [ ! -f "$d/BOARD.md" ] && [ ! -f "$d/board.md" ] && [ ! -f "$d/PROJECT.md" ]; then
+    die "neither a ticket folder (rd.md) nor a tickets folder (BOARD.md, PROJECT.md): $d"
+  fi
+  TICKETS=$(cd "$d" && pwd)
+  room_find
+  if [ -n "$ROOM_LOG" ]; then ref=$(room_ref); pref=$(oneline "$ROOM_NAME" | tr '|' '/'); dec="$(dirname "$ROOM_LOG")/DECISIONS.md"
+  else ref=${name:-$(basename "$(dirname "$TICKETS")")}; fi
+  printf '# Decision room reading set: %s, subject %s\n\n' "$ref" "$subject"
+  if [ -n "$tdir" ]; then
+    case "$subject" in plan|merge|ready) row=$subject ;; *)
+      stage=$(awk '/^## /{exit} index($0, "Stage:") == 1 { v = substr($0, 7); gsub(/^[ \t]+|[ \t\r]+$/, "", v); print v; exit }' "$tdir/rd.md")
+      case "$stage" in research|design|plan|plan-review|approve-plan) row=plan ;; build|test|review|approve-merge|merge|check|done) row=merge ;; *) row=ready ;; esac ;;
+    esac
+    printf 'Written by `sa room context`; it changes no file. Read with it: %s and %s, and every file under "## Read whole".\n' "$tdir/rd.md" "$tdir/eval.md"
+    [ "$row" = "$subject" ] || printf 'The notes are read as for %s: the stage of the ticket is %s.\n' "$row" "${stage:--}"
+  else
+    printf 'Written by `sa room context`; it changes no file. Read with it every file under "## Read whole".\n'
+  fi
+  if [ -n "$ROOM_LOG" ]; then
+    printf 'The whole files of the room, only to look up one line this set names: %s and %s\n' "$ROOM_LOG" "$dec"
+    if [ -n "$tdir" ]; then
+      room_set_lines "$ROOM_LOG" "$ref" "Log lines of $ref" "$ROOM_SET_LINES" ticket
+      room_set_lines "$ROOM_LOG" "$pref" "Notes of the project" 0 notes
+      room_set_decisions "$dec" "$ref" "$subject" "Decisions on $ref"
+      room_set_decisions "$dec" "$pref" "" "Decisions on the whole project"
+    else
+      room_set_lines "$ROOM_LOG" "$pref" "Log lines of $ref" "$ROOM_CTX_LINES" nonotes
+      room_set_lines "$ROOM_LOG" "$pref" "Notes of the project" 0 notes
+      room_set_decisions "$dec" "$ref" "$subject" "Decisions on $ref"
+    fi
+  else
+    printf 'no decision room for this project: no room history, no decisions\n'
+  fi
+  if [ -n "$tdir" ]; then
+    q=$(room_ctx_questions "$tdir")
+    printf '\n## Open questions on %s\n%s\n' "$ref" "${q:-none}"
+  fi
+  case "$subject" in S*)
+    printf '\n## Suggestion %s\n' "$subject"
+    { [ -f "$TICKETS/SUGGESTIONS.md" ] && SA_H="## $subject [" awk '
+        index($0, ENVIRON["SA_H"]) == 1 { f = 1; sub(/^## /, "### "); print; next } f && /^## / { exit } f && NF' "$TICKETS/SUGGESTIONS.md" | grep .; } ||
+      printf 'none: %s is not in %s\n' "$subject" "$TICKETS/SUGGESTIONS.md" ;;
+  esac
+  if [ -n "$tdir" ]; then
+    for f in results test review review-response plan plan-review questions check; do
+      [ -f "$tdir/notes/$f.md" ] || continue
+      form=$(room_set_form "$row" "$f")
+      if [ "$form" = rounds ]; then
+        body=$(room_set_rounds "$tdir/notes/$f.md" "notes/$f.md"); rc=$?
+        if [ "$rc" = 0 ]; then printf '\n%s\n' "$body"; continue; fi
+        form=whole   # no round line (or an empty file): nothing to cut by, so it is read whole
+      fi
+      if [ "$form" = whole ]; then whole="$whole- $tdir/notes/$f.md ($(fsize "$tdir/notes/$f.md") bytes)
+"
+      else out="$out- $tdir/notes/$f.md ($(fsize "$tdir/notes/$f.md") bytes)
+"
+      fi
+    done
+  fi
+  # PROJECT.md holds the standing rules of the project, under whatever heading: always read whole
+  [ -f "$TICKETS/PROJECT.md" ] && whole="$whole- $TICKETS/PROJECT.md ($(fsize "$TICKETS/PROJECT.md") bytes)
+"
+  for f in BOARD.md SUGGESTIONS.md LEARNED.md; do
+    [ -z "$tdir" ] || [ "$f" = LEARNED.md ] || continue   # a ticket lists only the lessons; a tickets folder all three
+    [ -f "$TICKETS/$f" ] && out="$out- $TICKETS/$f ($(fsize "$TICKETS/$f") bytes)
+"
+  done
+  printf '\n## Read whole\n%s' "${whole:-none
+}"
+  printf '\n## Left out for %s (open one only when the question turns on it)\n%s' "$subject" "${out:-none
+}"
+  return 0
+}
+room_context() {
+  [ $# -ge 1 ] || die "usage: sa room context <ticket-dir | tickets-dir> [<subject>]"
+  if [ $# -ge 2 ]; then room_reading_set "$1" "$2"; return; fi   # with a subject: the reading set of that question
+  local d="${1%/}" name tdir="" ref pref dec q f
+  [ -d "$d" ] || die "no such ticket or tickets folder: $d"
+  ROOM_TID=""
+  if [ -f "$d/rd.md" ]; then
+    name=$(basename "$d")
+    case "$name" in [0-9][0-9][0-9]-*) ROOM_TID=${name%%-*} ;; *) die "ticket folder must be named NNN-slug, got '$name'" ;; esac
+    tdir=$(cd "$d" && pwd); d="$d/.."
+  fi
+  TICKETS=$(cd "$d" && pwd)
+  room_find
+  [ -n "$ROOM_LOG" ] || { echo "no decision room for this project; nothing to read"; return 0; }
+  ref=$(room_ref); pref=$(oneline "$ROOM_NAME" | tr '|' '/'); dec="$(dirname "$ROOM_LOG")/DECISIONS.md"
+  printf '# Decision room context: %s\n\n' "$ref"
+  printf 'A digest written by `sa room context`: what the room holds on %s and nothing on other tickets.\n' "$ref"
+  printf 'The whole files, to look up one line this digest names: %s and %s\n' "$ROOM_LOG" "$dec"
+  if [ -n "$ROOM_TID" ]; then
+    room_ctx_lines "$ROOM_LOG" "$ref" "Log lines of $ref" "$ROOM_CTX_LINES"
+    room_ctx_lines "$ROOM_LOG" "$pref" "The project's own lines" "$ROOM_CTX_PROJECT"
+  else
+    room_ctx_lines "$ROOM_LOG" "$pref" "The project's own lines" "$ROOM_CTX_LINES"
+  fi
+  room_ctx_decisions "$dec" "$ref"
+  if [ -n "$tdir" ]; then
+    q=$(room_ctx_questions "$tdir")
+    printf '\n## Open questions on %s\n%s\n' "$ref" "${q:-none}"
+    printf '\n## Files of this ticket (read the ones the question needs)\n'
+    for f in rd.md eval.md notes/results.md notes/test.md notes/review.md notes/plan.md notes/plan-review.md \
+             notes/questions.md notes/review-response.md notes/check.md; do
+      [ -f "$tdir/$f" ] && printf -- '- %s (%s bytes)\n' "$tdir/$f" "$(wc -c < "$tdir/$f" | tr -d ' ')"
+    done
+  else
+    printf '\n## Files of this project\n'
+    for f in BOARD.md PROJECT.md SUGGESTIONS.md; do
+      [ -f "$TICKETS/$f" ] && printf -- '- %s (%s bytes)\n' "$TICKETS/$f" "$(wc -c < "$TICKETS/$f" | tr -d ' ')"
+    done
+  fi
+  return 0
+}
+
+review_blocks() { # review_blocks <review.md>: empty when each reviewer block of the newest round holds its own
+  # full-id 'Reviewed commit:' and 'Ship allowed:' (the Codex part, each 'Second review', or an override block)
+  [ -f "$1" ] || { echo "no notes/review.md"; return 0; }
+  awk '
+    function full(x) { sub(/^[^:]*:[ \t]*/, "", x); gsub(/[ \t\r]+$/, "", x); return length(x) == 40 && x !~ /[^0-9a-f]/ }
+    /^```/ { fence = !fence }
+    /^--- Round/ { r=1; nb=1; cm[1]=0; vd[1]=0; short=0; ov=0; next }
+    !fence && /^--- (User|Decision room) override(,|[ \t\r]*$)/ { ov=1; oc=0; ovd=0; short=0; next }
+    ov { if (index($0, "Reviewed commit:") == 1) { oc=1; if (!full($0)) short=1 } if (index($0, "Ship allowed:") == 1) ovd=1; next }
+    tolower($0) ~ /^second review/ { nb++; cm[nb]=0; vd[nb]=0; next }
+    index($0, "Reviewed commit:") == 1 { cm[nb]=1; if (!full($0)) short=1 }
+    index($0, "Ship allowed:") == 1 { vd[nb]=1 }
+    END {
+      if (!r) { print "no review round in notes/review.md"; exit }
+      if (ov) { if (!oc || !ovd) print "the newest review round has no verdict yet"; else if (short) print "the override names a commit that is not a full commit id"; exit }
+      for (i = 1; i <= nb; i++) if (!cm[i] || !vd[i]) { print "the newest review round has no verdict yet"; exit }
+      if (short) print "a '\''Reviewed commit:'\'' line of the newest review round is not a full commit id"
+    }' "$1"
+}
+
+room_pr_ok() { # FR-12 of superagent#003: may an agent merge this ticket's PR? Changes no file, uses no network.
+  [ $# -ge 1 ] || die "usage: sa room pr-ok <ticket-dir>"
+  ticket_vars "$1"
+  room_find
+  local urls url pair reviewed ship line ac dn ref tsec tested tres why st sg q
+  local re="^Merge approved: [0-9]{4}-[0-9]{2}-[0-9]{2} for ([^ ]+) \\(decision room D([0-9]+), on the user's standing order of [0-9]{4}-[0-9]{2}-[0-9]{2}\\)[[:space:]]*$"
+  # 1. the switch
+  { [ -n "$ROOM_PREFS" ] && [ "$(room_switch "$ROOM_PREFS")" = on ]; } || die "the decision room is switched off (${ROOM_PREFS:-this project has no room}); the user merges"
+  # 2. the project delivers through pull requests
+  grep -qE '^Delivery:[[:space:]]*direct-PR([[:space:]]|$)' "$TICKETS/PROJECT.md" 2>/dev/null || die "the project does not deliver through pull requests (no 'Delivery: direct-PR' in PROJECT.md)"
+  # 3. exactly one pull request URL
+  [ -f "$NOTES/pr.md" ] || die "no notes/pr.md: the builder opens the pull request first"
+  urls=$(grep -oE 'https?://[^][:space:]<>()"]+' "$NOTES/pr.md" 2>/dev/null || true)
+  url=$(printf '%s\n' "$urls" | head -1)
+  { [ -n "$urls" ] && [ "$urls" = "$url" ] && [[ "$url" =~ ^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+$ ]]; } ||
+    die "notes/pr.md does not hold exactly one GitHub pull request URL (https://github.com/<owner>/<repo>/pull/<number>)"
+  # 4. the room's merge approval names the last reviewed commit and a recorded merge decision (a) for this ticket
+  pair=$(last_round "$NOTES/review.md" 'Reviewed commit:' 'Ship allowed:'); reviewed=${pair%% *}; ship=${pair#* }
+  [ -n "$reviewed" ] || die "no 'Reviewed commit:' line in notes/review.md"
+  full_sha "$reviewed" || die "the last 'Reviewed commit:' of notes/review.md ('$(oneline "$reviewed")') is not a full commit id"
+  line=$(grep '^Merge approved:' "$NOTES/merge.md" 2>/dev/null | tail -1)
+  [ -n "$line" ] || die "no 'Merge approved:' line in notes/merge.md. Next: the clerk carries out the room's merge decision"
+  [[ "$line" =~ $re ]] || die "the last 'Merge approved:' line of notes/merge.md is not the decision room's ('Merge approved: <date> for <commit> (decision room D<n>, on the user's standing order of <date>)')"
+  ac=${BASH_REMATCH[1]}; dn=${BASH_REMATCH[2]}
+  [ "$ac" = "$reviewed" ] || die "the approval is for $(oneline "$ac"), not the last reviewed commit ($reviewed)"
+  ref=$(room_ref)
+  SA_H="## D$dn" SA_T="Ticket: $ref" awk '
+    $0 == ENVIRON["SA_H"] { f=1; next } /^## / { f=0 }
+    f && $0 == ENVIRON["SA_T"] { a=1 } f && $0 == "Subject: merge" { b=1 } f && index($0, "Decision: (a) ") == 1 { c=1 }
+    END { exit !(a && b && c) }' "$(dirname "$ROOM_LOG")/DECISIONS.md" 2>/dev/null ||
+    die "D$dn is not a merge decision with option (a) for $ref in DECISIONS.md"
+  # 5. the newest test round passes, and the newest review round lets this same commit ship
+  tsec=$(awk '/^--- Round/ { c=""; v=""; next }
+    index($0, "Tested commit:") == 1 { c=$0; sub(/^[^:]*:[ \t]*/, "", c); split(c, a, /[ \t\r]/); c=a[1]; v="" }
+    index($0, "Result:") == 1 { v=$0; sub(/^[^:]*:[ \t]*/, "", v); gsub(/[ \t\r]+$/, "", v); v=tolower(v) }
+    END { print c, v }' "$NOTES/test.md" 2>/dev/null)
+  tested=${tsec%% *}; tres=${tsec#* }
+  { [ -n "$tested" ] && [ -n "$tres" ]; } || die "the newest test round has no result yet"
+  [ "$tres" = pass ] || die "the last test round's result is '$tres', not pass"
+  why=$(review_blocks "$NOTES/review.md"); [ -z "$why" ] || die "$why"
+  why=$(review_pair "$NOTES/review.md"); [ -z "$why" ] || die "$why"
+  [ "$ship" = yes ] || die "the last review round's verdict is 'Ship allowed: ${ship:-missing}'"
+  [ "$tested" = "$reviewed" ] || die "the tested commit is not the reviewed commit (tested $(oneline "$tested"), reviewed $reviewed)"
+  # 6. not stopped, at the merge stages, and nothing open
+  st=$(board_get); sg=${st##*|}; st=${st%%|*}
+  if [ "$st" = stopped ] || [ "$(rd_field Status)" = stopped ]; then die "the ticket is stopped by the user"; fi
+  case "$sg" in approve-merge|merge) ;; *) die "the ticket is at stage '$sg', not approve-merge or merge" ;; esac
+  q=$(grep -c '^## Q[0-9][0-9]* \[open\]' "$NOTES/questions.md" 2>/dev/null || true)
+  { [ "${q:-0}" = 0 ] && [ "$(rd_open_questions)" = 0 ]; } || die "the ticket has an open question"
+  echo "PR-OK: $url $reviewed"
+}
+
+# sa room hook (superagent#008): the router session's hooks, declared in router-settings.json and loaded with
+# `claude --agent router --settings ~/.claude/superagent/router-settings.json`. PreToolUse on Agent logs the
+# dispatch with the call's real model and effort; PreToolUse/PostToolUse on AskUserQuestion log each question
+# and its answer. Only the router's own calls (agent_type router, no agent_id), once per delivery; a line waits
+# at most 2 s on a busy log, nothing reaches stdout, and every failure is swallowed. Nothing here deletes a file.
+SA_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+# The payload as NUL-separated fields: event tool agent_type agent_id session_id tool_use_id cwd, then
+# D role folder stage model effort (Agent) or Q|A <question> <line text> per question (AskUserQuestion).
+# Text only: no field is ever evaluated, control characters become spaces (one log line each).
+HOOK_PARSE='use JSON::PP; binmode(STDOUT, ":utf8"); local $/; my $d = eval { decode_json(<STDIN>) }; exit 0 unless ref $d eq "HASH";
+  sub cl { my $v = shift; $v = "" unless defined $v && !ref $v; $v =~ s/[\x00-\x1f\x7f]+/ /g; $v }
+  sub raw { my $v = shift; defined $v && !ref $v ? $v : "" }
+  my @o = map { cl($d->{$_}) } qw(hook_event_name tool_name agent_type agent_id session_id tool_use_id cwd);
+  print join("\0", @o), "\0";
+  my $i = ref $d->{tool_input} eq "HASH" ? $d->{tool_input} : {};
+  if ($o[1] eq "Agent") {
+    my ($f, $g, $s) = ("", "", "");
+    for my $l (split /\r?\n/, raw($i->{prompt})) {
+      $f = $1 if $l =~ /^\s*Tickets folder:\s*(.*?)\s*$/;
+      $g = $1 if $l =~ /^\s*Ticket folder:\s*(.*?)\s*$/;   # a ticket folder wins over a tickets folder
+      $s = $1 if $s eq "" && $l =~ /^\s*Stage:\s*(.*?)\s*$/;
+    }
+    print join("\0", "D", cl($i->{subagent_type}), cl($g ne "" ? $g : $f), cl($s), cl($i->{model}), cl($i->{effort}), cl($i->{description})), "\0";
+  } elsif ($o[1] eq "AskUserQuestion") {
+    my $r = ref $d->{tool_response} eq "HASH" ? $d->{tool_response} : {};
+    my $a = ref $r->{answers} eq "HASH" ? $r->{answers} : {};
+    for my $q (ref $i->{questions} eq "ARRAY" ? @{ $i->{questions} } : ()) {
+      next unless ref $q eq "HASH"; my $t = cl($q->{question}); next if $t eq "";
+      if ($o[0] eq "PreToolUse") {
+        my ($n, @op) = (0);
+        for my $x (ref $q->{options} eq "ARRAY" ? @{ $q->{options} } : ()) {
+          next unless ref $x eq "HASH"; my ($l, $e) = (cl($x->{label}), cl($x->{description}));
+          push @op, "(" . chr(97 + $n++) . ") $l" . ($e ne "" ? " - $e" : "") }
+        print join("\0", "Q", $t, "asked the user: $t | options: " . join("; ", @op)), "\0";
+      } elsif (defined $a->{$q->{question}} && !ref $a->{$q->{question}}) {   # the captured shape: answers{question}
+        my $h = cl($q->{header}); $h = "Question" if $h eq "";
+        print join("\0", "A", $t, "$h answered by the user: " . cl($a->{$q->{question}}) . " | question: $t"), "\0";
+      } } }'
+hook_id() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_' | cut -c1-120; }
+hook_put() { # hook_put <file> <content>: written whole under a temporary name, then renamed into place
+  mkdir -p "$(dirname "$1")" 2>/dev/null && printf '%s\n' "$2" > "$1.tmp.$$" 2>/dev/null && command mv -f "$1.tmp.$$" "$1" 2>/dev/null
+  return 0
+}
+role_default() { # role_default <role> <model|effort>: the role file's value, labelled, else the session's
+  local v
+  v=$(sed -n '2,/^---$/p' "$SA_DIR/../agents/$1.md" 2>/dev/null | sed -n "s/^$2:[[:space:]]*//p" | head -1 | sed 's/[[:space:]]*$//')
+  if [ -n "$v" ]; then printf '%s (agent default)' "$v"; else printf 'session default'; fi
+}
+hook_write() { # hook_write <kind> <who> <text>: one line in the log set in ROOM_LOG/ROOM_NAME/ROOM_TID; waits at most 2 s on a busy log
+  ROLE_NAMED=$2; BADGE=""; ROOM_FIXED=1; LOGLOCK_TRIES=20
+  room_log "$1" "$2: $3"
+  ROOM_FIXED=""
+}
+hook_ws() { # hook_ws <folder>: the nearest folder at or above it holding ACTIVE-PROJECTS.md, if any
+  local d=$1
+  while [ -n "$d" ]; do
+    [ -f "$d/ACTIVE-PROJECTS.md" ] && { printf '%s\n' "$d"; return 0; }
+    { [ "$d" = / ] || [ "$d" = . ]; } && break
+    d=$(dirname "$d")
+  done
+  return 0
+}
+hook_room() { # hook_room <folder of a brief>: sets TICKETS ROOM_TID ROOM_LOG ROOM_NAME; 1 when it names no project with a room
+  local dir=${1%/} name
+  case "$dir" in /*) [ -d "$dir" ] || return 1 ;; *) return 1 ;; esac
+  ROOM_TID=""
+  if [ -f "$dir/rd.md" ]; then
+    name=$(basename "$dir")
+    case "$name" in [0-9][0-9][0-9]-*) ROOM_TID=${name%%-*} ;; *) return 1 ;; esac
+    dir="$dir/.."
+  fi
+  [ -f "$dir/PROJECT.md" ] || [ -f "$dir/BOARD.md" ] || return 1   # a tickets folder only
+  TICKETS=$(cd "$dir" 2>/dev/null && pwd) || return 1
+  room_find
+  [ -n "$ROOM_LOG" ]
+}
+hook_dispatch() { # hook_dispatch <session> <tool_use_id> <role> <folder> <stage> <model> <effort> <cwd> [<the Agent call's description>]
+  local sid=$1 tid=$2 role=$3 dir=$4 stage=$5 model=$6 effort=$7 cwd=$8 label=${9:-} ref ws
+  label=$(printf '%s' "$label" | cut -c1-120)   # the agent's name and task, as the router wrote them: "Andrea > my-app > 009 build"
+  case "$role" in ""|*[!a-z-]*) return 0 ;; esac
+  [ -f "$SA_DIR/../agents/$role.md" ] || return 0   # a superagent role only
+  hook_room "$dir" || return 0
+  ref=$(room_ref)
+  hook_write dispatch "$role" "started by router: stage ${stage:-unknown}, model ${model:-$(role_default "$role" model)}, effort ${effort:-$(role_default "$role" effort)}${label:+, as $label}"
+  [ "$ROOM_OK" = 1 ] || return 0
+  # one marker per start: the started agent's own `sa room event ... dispatch` claims it instead of writing
+  hook_put "$(dirname "$ROOM_LOG")/.hooks/dispatched/$(hook_id "$tid")" "$sid	$ref	$role"
+  # the project registry of the router's own workspace (from its cwd), for questions that name the project
+  # later: an outside Room: project too (decision room D11)
+  ws=$(hook_ws "$cwd")
+  [ -z "$ws" ] || hook_put "$ws/decision-room/.hooks/projects/$(printf '%s' "$TICKETS" | cksum | cut -d' ' -f1)" "$TICKETS"
+  return 0
+}
+dispatch_claimed() { # dispatch_claimed <role>: this agent runs in the router session whose hook logged its start; take that marker, once
+  local sid=${CLAUDE_CODE_SESSION_ID:-} dir f
+  [ "${CLAUDE_CODE_CHILD_SESSION:-}" = 1 ] && [ -n "$sid" ] && [ -n "$ROOM_LOG" ] || return 1
+  dir="$(dirname "$ROOM_LOG")/.hooks/dispatched"
+  [ -d "$dir" ] || return 1
+  while IFS= read -r f; do
+    command mv "$dir/$f" "$dir/$f.claimed.$$" 2>/dev/null && return 0   # a rename has one winner; the claimed file stays
+  done < <(perl -e 'my ($d, $want) = @ARGV; opendir(my $h, $d) or exit 0; my @c;
+      for my $f (readdir $h) { next if $f =~ /^\./ || $f =~ /\.(claimed|tmp)\./; my $p = "$d/$f"; next unless -f $p;
+        my $m = (stat $p)[9]; next if time - $m > 300;   # the age is the mtime, nothing else
+        open(my $x, "<", $p) or next; my $l = <$x>; next unless defined $l; chomp $l; push @c, [$m, $f] if $l eq $want }
+      print "$_->[1]\n" for sort { $a->[0] <=> $b->[0] || $a->[1] cmp $b->[1] } @c' "$dir" "$sid	$(room_ref)	$1" 2>/dev/null)
+  return 1
+}
+HC_DIR=(); HC_NAME=(); HC_ALIAS=(); HC_LOG=()
+hook_candidate() { # hook_candidate <tickets dir>: a known project, once
+  local t i a pn
+  t=$(cd "$1" 2>/dev/null && pwd) || return 0
+  for ((i = 0; i < ${#HC_DIR[@]}; i++)); do [ "${HC_DIR[$i]}" = "$t" ] && return 0; done
+  TICKETS=$t; room_find
+  [ -n "$ROOM_LOG" ] || return 0
+  a=" ${ROOM_NAME##*/} "
+  pn=$(sed -n 's/^# Project:[[:space:]]*//p' "$t/PROJECT.md" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')
+  [ -z "$pn" ] || a="$a$pn "
+  HC_DIR+=("$t"); HC_NAME+=("$ROOM_NAME"); HC_ALIAS+=("$a"); HC_LOG+=("$ROOM_LOG")
+}
+hook_tickets_in() { # hook_tickets_in <folder>: the tickets folder it is, or holds, if any
+  local t
+  case "$1" in */tickets) [ -f "$1/PROJECT.md" ] && { printf '%s\n' "$1"; return 0; } ;; esac
+  for t in tickets spec/tickets specs/tickets docs/tickets; do
+    [ -f "$1/$t/PROJECT.md" ] && { printf '%s\n' "$1/$t"; return 0; }
+  done
+  return 0
+}
+hook_questions() { # hook_questions <cwd> (Q|A <question> <text>)...
+  local cwd=$1 ws="" d f t i n k p tok nm num hit kind q line pass w c
+  shift
+  ws=$(hook_ws "$cwd")
+  HC_DIR=(); HC_NAME=(); HC_ALIAS=(); HC_LOG=()
+  if [ -n "$ws" ]; then
+    while IFS=$'\t' read -r p d f; do hook_candidate "$(dirname "$f")"; done < <(active_projects "$ws")
+    for f in "$ws"/decision-room/.hooks/projects/*; do
+      [ -f "$f" ] && case "$f" in *.tmp.*) ;; *) hook_candidate "$(head -1 "$f")" ;; esac
+    done
+  fi
+  if [ -n "$cwd" ]; then t=$(hook_tickets_in "$cwd"); [ -z "$t" ] || hook_candidate "$t"; fi
+  # the room's own log, for a question that names no project: the workspace's room, else (a router run
+  # in one standalone project) the room its PROJECT.md names with "Room: <absolute path>"
+  local own=""
+  if [ -n "$ws" ]; then own="$ws/decision-room/LOG.md"
+  elif [ -n "${t:-}" ]; then
+    own=$(sed -n 's/^Room:[[:space:]]*//p' "$t/PROJECT.md" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')
+    case "$own" in /*) own="$own/LOG.md" ;; *) own="" ;; esac
+  fi
+  while [ $# -ge 3 ]; do
+    kind=$1 q=$2 line=$3
+    shift 3
+    local M_LOG=() M_NAME=() M_TID=() M_DIR=()
+    # an absolute path in the question names its project (an external Room: project before any dispatch)
+    while IFS= read -r p; do
+      for ((k = 0; k < 5; k++)); do
+        t=$(hook_tickets_in "$p"); [ -z "$t" ] || { hook_candidate "$t"; break; }
+        p=$(dirname "$p"); [ "$p" = / ] && break
+      done
+    done < <(printf '%s\n' "$q" | grep -oE '/[^][[:space:]"'"'"'`()<>,;]+' 2>/dev/null)
+    while IFS= read -r tok; do
+      nm=${tok%%#*}; num=""; case "$tok" in *#*) num=${tok#*#} ;; esac
+      nm=${nm%[.:]}
+      [ -n "$nm" ] || continue
+      # exact case over all candidates first (full name, then alias); then, for Name#NNN only, any case
+      hit=-1
+      for pass in exact folded; do
+        [ "$hit" = -1 ] || break
+        [ "$pass" = exact ] || [ -n "$num" ] || break   # a bare word never folds: "Demo ticket" in prose names nothing
+        w=$nm; [ "$pass" = exact ] || w=$(printf '%s' "$nm" | tr '[:upper:]' '[:lower:]')
+        for ((i = 0; i < ${#HC_DIR[@]}; i++)); do
+          c=${HC_NAME[$i]}; [ "$pass" = exact ] || c=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
+          [ "$c" = "$w" ] && { hit=$i; break; }   # a full name wins
+        done
+        if [ "$hit" = -1 ]; then
+          n=0
+          for ((i = 0; i < ${#HC_DIR[@]}; i++)); do
+            c=${HC_ALIAS[$i]}; [ "$pass" = exact ] || c=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
+            case "$c" in *" $w "*) n=$((n + 1)); hit=$i ;; esac
+          done
+          [ "$n" = 1 ] || hit=-1   # an alias shared by two projects names neither
+        fi
+      done
+      [ "$hit" != -1 ] || continue
+      for ((k = 0; k < ${#M_LOG[@]}; k++)); do [ "${M_LOG[$k]}" = "${HC_LOG[$hit]}" ] && break; done
+      if [ "$k" = "${#M_LOG[@]}" ]; then M_LOG+=("${HC_LOG[$hit]}"); M_NAME+=("${HC_NAME[$hit]}"); M_TID+=("$num"); M_DIR+=("${HC_DIR[$hit]}")
+      elif [ -z "${M_TID[$k]}" ]; then M_TID[$k]=$num; fi
+    done < <(printf '%s\n' "$q" | grep -oE '[A-Za-z0-9._/-]+(#[0-9]+)?' 2>/dev/null)
+    [ "$kind" = Q ] && kind=question || kind=answer
+    if [ "${#M_LOG[@]}" = 0 ]; then
+      [ -n "$own" ] || continue
+      ROOM_LOG=$own; ROOM_NAME=router; ROOM_TID=""
+      hook_write "$kind" router "$line"
+    else
+      for ((k = 0; k < ${#M_LOG[@]}; k++)); do
+        ROOM_LOG=${M_LOG[$k]}; ROOM_NAME=${M_NAME[$k]}; ROOM_TID=${M_TID[$k]}; TICKETS=${M_DIR[$k]}   # TICKETS: the digest of that ticket
+        hook_write "$kind" router "$line"
+      done
+    fi
+  done
+}
+room_hook() { # room_hook pre|post < hook JSON
+  local ev st x=() f
+  case "${1:-}" in pre) ev=PreToolUse ;; post) ev=PostToolUse ;; *) echo "sa room hook: want pre or post"; return 0 ;; esac
+  while IFS= read -r -d '' f; do x+=("$f"); done < <(perl -e "$HOOK_PARSE" 2>/dev/null)
+  [ "${#x[@]}" -ge 7 ] || return 0
+  [ "${x[0]}" = "$ev" ] && [ "${x[2]}" = router ] && [ -z "${x[3]}" ] && [ -n "${x[4]}" ] && [ -n "${x[5]}" ] || return 0
+  st=${SA_HOOK_STATE:-${TMPDIR:-/tmp}/sa-room-hook}
+  # The tier rule, judged before the once-per-delivery mark, so that a repeated delivery is refused again;
+  # only its note is written once. Exit 2 reaches Claude Code: it blocks the call and shows the one stderr line.
+  local refuse=""
+  if [ "$1" = pre ] && [ "${x[1]}" = Agent ] && [ "${#x[@]}" -ge 13 ] && [ "${x[7]}" = D ]; then
+    tier_session_old || refuse=$(tier_refusal "${x[8]}" "${x[9]}" "${x[10]}" "${x[11]}" 2>/dev/null)
+  fi
+  if [ -n "$refuse" ]; then
+    printf '%s\n' "$refuse"
+    { mkdir -p "$st/seen" && mkdir "$st/seen/$(hook_id "${x[4]}").$(hook_id "${x[5]}").$1" && hook_room "${x[9]}" &&
+        SA_NO_DIGEST=1 hook_write note router "tier rule: ${refuse#refused: }"; } >/dev/null 2>&1
+    return 2
+  fi
+  mkdir -p "$st/seen" 2>/dev/null || return 0
+  mkdir "$st/seen/$(hook_id "${x[4]}").$(hook_id "${x[5]}").$1" 2>/dev/null || return 0   # once per delivery
+  case "${x[1]}" in
+    Agent) [ "${#x[@]}" -ge 13 ] && [ "${x[7]}" = D ] && hook_dispatch "${x[4]}" "${x[5]}" "${x[8]}" "${x[9]}" "${x[10]}" "${x[11]}" "${x[12]}" "${x[6]}" "${x[13]:-}" ;;
+    AskUserQuestion) [ "${#x[@]}" -ge 10 ] && hook_questions "${x[6]}" "${x[@]:7}" ;;
+  esac
+  return 0
+}
+
+active_projects() { # active_projects <workspace>: "<path as ticked>\t<project folder>\t<board file>" per ticked project with a board
+  local ws=$1 p base b t n
+  sed -n 's/^- \[[xX]\] \([^ ]*\).*/\1/p' "$ws/ACTIVE-PROJECTS.md" 2>/dev/null | while IFS= read -r p; do
+    case "$p" in /*) base="$p" ;; *) base="$ws/$p" ;; esac   # as watchdog.sh does
+    b=""
+    for t in tickets spec/tickets specs/tickets docs/tickets; do for n in BOARD.md board.md; do
+      [ -z "$b" ] && [ -f "$base/$t/$n" ] && b="$base/$t/$n"
+    done; done
+    [ -n "$b" ] || continue
+    printf '%s\t%s\t%s\n' "$p" "$(cd "$base" && pwd)" "$b"
+  done
+}
+
+# sa room watch (superagent#010): follow every LOG.md under <workspace>/decision-room/ live, in colour, until Ctrl-C.
+# The log files stay plain text: the colours exist only in what this prints. It only reads (it creates, changes and
+# locks no file, so it never slows sa or the gate) and prints a line only once it ends with a newline. A refusal is one
+# line on stderr, nothing on stdout, exit 1. The viewer is the perl program below; sa becomes it (exec), so there is no
+# child to leave behind. It gets the room folder, --since, --project and whether colour is on as arguments, and the two
+# badge tables and the unknown badge in the environment.
+WATCH_USAGE='usage: sa room watch [<workspace>] [--since <minutes>] [--project <name>] [--color auto|always|never]'
+watch_die() { echo "refused: $*" >&2; exit 1; }
+room_watch() {
+  local ws="" since="" proj="" color=auto opt val dir use=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since|--project|--color) [ $# -ge 2 ] || watch_die "$1 needs a value ($WATCH_USAGE)"; opt=$1; val=$2; shift 2 ;;
+      --since=*|--project=*|--color=*) opt=${1%%=*}; val=${1#*=}; shift ;;
+      -*) watch_die "unknown option '$(oneline "$1")' ($WATCH_USAGE)" ;;
+      *) [ -z "$ws" ] || watch_die "unexpected argument '$(oneline "$1")': one workspace folder only ($WATCH_USAGE)"; ws=$1; shift; continue ;;
+    esac
+    case "$opt" in
+      --since) case "$val" in ""|*[!0-9]*) since="" ;; *[1-9]*) since=$val ;; *) since="" ;; esac   # digits, one of them not 0
+               [ -n "$since" ] || watch_die "--since needs a whole number of minutes, 1 or more (got '$(oneline "$val")')" ;;
+      --project) [ -n "$val" ] || watch_die "--project needs a project name ($WATCH_USAGE)"; proj=$val ;;
+      --color) case "$val" in auto|always|never) color=$val ;; *) watch_die "--color needs auto, always or never (got '$(oneline "$val")')" ;; esac ;;
+    esac
+  done
+  command -v perl >/dev/null 2>&1 || watch_die "perl is needed to follow the logs, and was not found"
+  if [ -n "$ws" ]; then
+    [ -d "$ws" ] || watch_die "no such workspace folder: $(oneline "$ws")"
+    dir=$(cd "$ws" && pwd)
+  else
+    dir=$PWD   # the nearest folder at or above this one that holds ACTIVE-PROJECTS.md
+    while [ ! -f "$dir/ACTIVE-PROJECTS.md" ]; do
+      [ "$dir" != / ] || watch_die "no workspace found: no ACTIVE-PROJECTS.md at or above $(oneline "$PWD") (pass the workspace folder)"
+      dir=$(dirname "$dir")
+    done
+  fi
+  [ -d "$dir/decision-room" ] || watch_die "no decision-room folder in $dir"
+  case "$color" in always) use=1 ;; auto) if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then use=1; fi ;; esac
+  SA_WATCH_BADGES=$BADGE_TABLE SA_WATCH_COLORS=$BADGE_COLORS SA_WATCH_OTHER=$BADGE_OTHER LC_ALL=C \
+    exec perl - "$dir/decision-room" "$since" "$proj" "$use" <<'PERL'
+use strict;
+use warnings;
+use Fcntl qw(O_RDONLY);
+use File::Find ();
+use POSIX ();
+
+my ($room, $since, $only, $color) = @ARGV;
+$room =~ s{(?<=.)/+\z}{};
+my $other = $ENV{SA_WATCH_OTHER} || '?';
+my $SEP = '1;38;5;244';     # the line that names a project: bold, grey
+my $TICK = 0.5;             # seconds between two looks at the logs, so a new line shows within a second
+my $RESCAN = 4;             # looks between two searches for a new LOG.md, so a new log is followed within 3 seconds
+my $RULE = "\xe2\x94\x80";  # the characters are written as bytes, so the program does not depend on its own encoding
+my $DOT = "\xc2\xb7";
+
+sub refuse { print STDERR "refused: @_\n"; exit 1 }
+$SIG{INT} = $SIG{TERM} = sub { exit 0 };   # no child to stop, and each line is one write: nothing is left open
+select((select(STDOUT), $| = 1)[0]);
+
+my (@legend, %code);
+for my $row (split /\n/, $ENV{SA_WATCH_BADGES} // '') {
+  my ($badge, $names) = split / /, $row, 2;
+  push @legend, [$badge, (split /,/, $names)[0]] if defined $names;
+}
+for my $row (split /\n/, $ENV{SA_WATCH_COLORS} // '') {
+  my ($badge, $c) = split / /, $row, 2;
+  $code{$badge} = $c if defined $c;
+}
+
+# the width of a separator: $COLUMNS when it is a positive integer, else the terminal's, else 80
+my ($term_cols, $term_at) = (0, 0);
+sub width {
+  my $c = $ENV{COLUMNS};
+  return $c + 0 if defined $c && $c =~ /^[0-9]+$/ && $c > 0;
+  if (-t STDOUT) {
+    if (time - $term_at >= 1) {   # asked at most once a second, and again after the terminal was resized
+      ($term_at, $term_cols) = (time, 0);
+      my $size = `stty size 2>/dev/null </dev/tty`;
+      $term_cols = $1 + 0 if defined $size && $size =~ /^[0-9]+ ([0-9]+)/;
+    }
+    return $term_cols if $term_cols > 0;
+  }
+  return 80;
+}
+
+# "──── <project> ───...", as wide as the terminal; when the name leaves no room for a closing rule, "──── <project>"
+sub separator {
+  my $name = shift;
+  my $fill = width() - (length($name) - ($name =~ tr/\x80-\xbf//)) - 6;   # the name counted in characters, not bytes
+  my $line = ($RULE x 4) . " $name" . ($fill >= 1 ? ' ' . ($RULE x $fill) : '');
+  return $color ? "\e[${SEP}m$line\e[0m" : $line;
+}
+
+sub legend_line {
+  my @item;
+  for my $l (@legend, [$other, 'unknown']) {
+    my $text = "$l->[0] $l->[1]";
+    my $c = $code{$l->[0]};
+    push @item, $color && defined $c && length $c ? "\e[${c}m$text\e[0m" : $text;
+  }
+  return join '  ', @item;
+}
+
+# every LOG.md under the room: path => project (its folder, relative to the room; "." for the room's own log)
+sub find_logs {
+  my %log;
+  local $SIG{__WARN__} = sub { };
+  File::Find::find({ no_chdir => 1, wanted => sub {
+    return unless -f $_ && m{/LOG\.md\z};
+    (my $project = substr($_, length($room) + 1)) =~ s{(?:^|/)LOG\.md\z}{};
+    $log{$_} = length $project ? $project : '.';
+  } }, $room);
+  return %log;
+}
+
+my %file;   # path => { path, project, pos (bytes already shown), dev, ino, time (the last date-time seen) }
+sub follow { my ($path, $project) = @_; $file{$path} = { path => $path, project => $project, pos => 0, time => '' } }
+
+# the whole lines that came after what was shown: a line counts once it ends with a newline, so a half-written
+# line, and one that sa takes back, is never seen; a log that was replaced or cut short is read from its start
+sub new_lines {
+  my $f = shift;
+  my @st = stat $f->{path} or return;
+  my ($dev, $ino, $size) = @st[0, 1, 7];
+  @$f{qw(pos time)} = (0, '') if defined $f->{ino} && ($dev != $f->{dev} || $ino != $f->{ino} || $size < $f->{pos});
+  @$f{qw(dev ino)} = ($dev, $ino);
+  return if $size <= $f->{pos};
+  sysopen(my $fh, $f->{path}, O_RDONLY) or return;
+  sysseek($fh, $f->{pos}, 0) or return;
+  my ($buf, $chunk) = ('');
+  while (sysread($fh, $chunk, 65536)) { $buf .= $chunk }
+  close $fh;
+  my $end = rindex $buf, "\n";
+  return if $end < 0;
+  $f->{pos} += $end + 1;
+  return split /\n/, substr($buf, 0, $end), -1;
+}
+
+# [date-time, path, number, line] for each line; a line with no date-time takes the one before it
+my $number = 0;
+sub keyed {
+  my $f = shift;
+  my @keyed;
+  for (@_) {
+    $f->{time} = $1 if /^(?:\S+ )?([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}) \|/;
+    push @keyed, [$f->{time}, $f->{path}, ++$number, $_];
+  }
+  return @keyed;
+}
+
+# one entry (and the separator that goes before it) in one write
+my ($last_project, $last_ref);
+sub show {
+  my $entry = shift;
+  my $project = $file{$entry->[1]}{project};
+  my $line = $entry->[3];
+  $line =~ tr/\t/ /;
+  $line =~ s/[\x00-\x1f\x7f]//g;      # nothing from a log reaches the terminal as a control: not a cursor move, not a colour
+  $line =~ s/\xc2[\x80-\x9f]//g;      # and the C1 controls of UTF-8 go too
+  return if $line =~ /^# / || $line !~ /\S/;
+  my ($badge, $time, $ref, $kind, $text) = $line =~ /^(?:(\S+) )?([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}) \| ([^|]*) \| ([^|]*) \| (.*)\z/s ? ($1, $2, $3, $4, $5) : ();
+  my $out = '';
+  if (!defined $last_project || $project ne $last_project) { $out = separator($project) . "\n" }
+  elsif (defined $ref && defined $last_ref && $ref ne $last_ref) { $out = ($color ? "\e[2m$DOT $DOT $DOT\e[0m" : "$DOT $DOT $DOT") . "\n" }
+  if (!defined $time || !$color) { $out .= "$line\n" }
+  else {
+    my $c = defined $badge ? $code{$badge} // '' : '';   # the agent's colour; none for the unknown badge or no badge
+    if ($kind eq 'decision') { $c = '1;35' }
+    elsif ($kind eq 'landing') { $c = '1;32' }
+    elsif ($kind eq 'stage' && $text =~ /^[^>]*-> (?:blocked|failed)(?![A-Za-z0-9_-])/
+       || $kind eq 'report' && $text =~ /^[^:]*: (?:refused|failed|blocked)(?![A-Za-z0-9_-])/) { $c = '31' }
+    my $rest = "$kind | $text";
+    $rest = "\e[${c}m$rest\e[0m" if length $c;
+    $out .= (defined $badge ? "$badge " : '') . "\e[2m$time\e[0m | \e[1m$ref\e[0m | $rest\n";
+  }
+  ($last_project, $last_ref) = ($project, defined $ref ? $ref : $last_ref);
+  print $out;
+}
+sub show_all { show($_) for sort { $a->[0] cmp $b->[0] or $a->[1] cmp $b->[1] or $a->[2] <=> $b->[2] } @_ }
+
+# --- start: look at every log once, so that what is written from now on is new
+my $cutoff;   # the oldest date-time that --since still shows
+if (length $since) {
+  my $seconds = $since * 60;
+  $cutoff = $seconds >= time ? '' : POSIX::strftime('%Y-%m-%d %H:%M', localtime(time - $seconds));
+}
+my %log = find_logs();
+for my $path (sort keys %log) { follow($path, $log{$path}) if !length $only || $log{$path} eq $only }
+if (length $only && !%file) {
+  my %known = map { $_ => 1 } values %log;
+  refuse("no log for the project '$only' in $room" . (%known ? ' (projects with a log: ' . join(', ', sort keys %known) . ')' : ' (no project has a log yet)'));
+}
+my @past;
+for my $path (sort keys %file) {
+  my @keyed = keyed($file{$path}, new_lines($file{$path}));
+  push @past, grep { $cutoff eq '' || $_->[0] ge $cutoff } @keyed if defined $cutoff;
+}
+print STDERR 'watching ' . scalar(keys %file) . " logs in $room (Ctrl-C to stop)\n";
+print legend_line() . "\n";
+show_all(@past);
+
+# --- follow
+my $tick = 0;
+while (1) {
+  select(undef, undef, undef, $TICK);
+  if (++$tick % $RESCAN == 0) {
+    -d $room or do { print STDERR "stopped: $room is gone\n"; exit 0 };   # a viewer left behind does not poll for ever
+    my %now = find_logs();
+    for my $path (sort keys %now) { follow($path, $now{$path}) if !exists $file{$path} && (!length $only || $now{$path} eq $only) }
+  }
+  my @fresh;
+  for my $path (sort keys %file) { push @fresh, keyed($file{$path}, new_lines($file{$path})) }
+  show_all(@fresh) if @fresh;
+}
+PERL
+}
+
+# --- run options and the tier rule (the owner's rule of 2026-11-22) ---------------------------------------------
+# The one tier table: `sa run-options` picks from it and `sa room hook pre` refuses a start above it. One row per line:
+# roles (",": several, "*": any other role) | stage key | model | max model the hook allows | effort | the stage, as
+# `sa run-options --table` prints it. The first row whose role and stage key match wins. Stage keys: plan (starts with
+# plan, not plan-review), scout (rd.md's header has Kind: scout or Risk: high), write, second, any, else a word the
+# stage contains. The stage is matched in lower case, because routers write it loosely.
+TIER_RULE='Tier rule of 2026-11-22: Fable 5.2 only for the decision room, ticket writing and the plan stage. A model the owner chose goes on the ticket first (a Model: or Plan model: line, written by the clerk).'
+TIER_ROWS='worker,teammate,reproducer|plan|fable|fable|medium|starts with `plan` (but not `plan-review` / `plan review`)
+worker,teammate,reproducer|design|opus|opus|high|`design`
+reproducer|any|opus|opus|medium|anything else
+worker,teammate|scout|opus|opus|medium|ticket rd.md has `Kind: scout`, or `Risk: high`
+worker,teammate|research|sonnet|sonnet|medium|`research`
+worker,teammate|any|sonnet|sonnet|low|anything else (build, report, unknown)
+ticket-writer|write|fable|fable|medium|`write`, `writing`, `project`, `draft`, `prd`, `spec`
+ticket-writer|any|haiku|sonnet|low|anything else (clerk jobs)
+tester|any|haiku|haiku|low|any
+codex-reviewer|second|opus|opus|medium|`second` or `claude`
+codex-reviewer|any|sonnet|opus|medium|anything else
+decision-room|referee|opus|opus|high|`referee`
+decision-room|any|sonnet|fable|medium|anything else
+merger,checker,watchdog,follow-up|any|sonnet|sonnet|low|any
+*|any|sonnet|fable|medium|any'
+TIER_RD=""; TIER_PROJ=""; T_MODEL=""; T_MAX=""; T_EFFORT=""; T_SRC=""; T_OWNER=""
+tier_table() { # the table as markdown rows, for agents/router.md to copy
+  local roles key model max effort text
+  printf '| Role | Stage contains | Model | Max model the hook allows | Effort |\n|---|---|---|---|---|\n'
+  while IFS='|' read -r roles key model max effort text; do
+    [ "$roles" = '*' ] && roles='any other role'
+    printf '| %s | %s | %s | %s | %s |\n' "${roles//,/, }" "$text" "$model" "$max" "$effort"
+  done <<< "$TIER_ROWS"
+}
+tier_files() { # tier_files <ticket-dir | tickets-dir>: sets TIER_RD TIER_PROJ; 1 when it is neither
+  local d=${1%/}
+  TIER_RD=""; TIER_PROJ=""
+  if [ -f "$d/rd.md" ]; then TIER_RD="$d/rd.md"; d="$d/.."
+  elif [ ! -f "$d/PROJECT.md" ] && [ ! -f "$d/BOARD.md" ] && [ ! -f "$d/board.md" ]; then return 1; fi
+  [ -f "$d/PROJECT.md" ] && TIER_PROJ="$d/PROJECT.md"
+  return 0
+}
+tier_word() { # tier_word <model|effort> <text>: the first model (or effort) word in a loose value, e.g. "claude-fable-5-2 (opus ...)"
+  local re='fable|opus|sonnet|haiku'
+  [ "$1" = effort ] && re='low|medium|high|xhigh|max'
+  printf '%s\n' "$2" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z' '\n' | grep -m1 -xE "$re" || true
+}
+tier_rank() { case "$1" in haiku) echo 1 ;; sonnet) echo 2 ;; opus) echo 3 ;; fable) echo 4 ;; *) echo 0 ;; esac; }
+owner_value() { # owner_value <file> <Name> <1: header only (before the first "## ")>: the value of the first "<Name>:" line
+  [ -f "$1" ] || return 0
+  awk -v k="$2:" -v hdr="$3" 'hdr == 1 && /^## /{exit}
+    tolower(substr($0, 1, length(k))) == tolower(k) { v = substr($0, length(k) + 1); gsub(/^[ \t]+|[ \t\r]+$/, "", v); print v; exit }' "$1"
+}
+tier_match() { # tier_match <stage key> <stage, lower case and trimmed>
+  case "$1" in
+    any) return 0 ;;
+    plan) case "$2" in plan-review*|"plan review"*) return 1 ;; plan*) return 0 ;; esac; return 1 ;;
+    scout) [ -n "$TIER_RD" ] && awk '/^## /{exit} { l = tolower($0) } l ~ /^kind:[ \t]*scout/ || l ~ /^risk:[ \t]*high/ { f = 1; exit } END { exit !f }' "$TIER_RD" ;;
+    write) case "$2" in *write*|*writing*|*project*|*draft*|*prd*|*spec*) return 0 ;; esac; return 1 ;;
+    second) case "$2" in *second*|*claude*) return 0 ;; esac; return 1 ;;
+    *) case "$2" in *"$1"*) return 0 ;; esac; return 1 ;;
+  esac
+}
+tier_stage() { oneline "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+tier_pick() { # tier_pick <role> <stage>: T_MODEL T_MAX T_EFFORT of the first matching row (TIER_RD set)
+  local s roles key model max effort text
+  s=$(tier_stage "$2")
+  while IFS='|' read -r roles key model max effort text; do
+    [ "$roles" = '*' ] || case ",$roles," in *",$1,"*) ;; *) continue ;; esac
+    tier_match "$key" "$s" || continue
+    T_MODEL=$model; T_MAX=$max; T_EFFORT=$effort
+    return 0
+  done <<< "$TIER_ROWS"
+}
+tier_resolve() { # tier_resolve <role> <stage>: the table's row, then the owner's lines (the ticket's beat the project's). Sets T_* too
+  local mk="" ek="" v w from=""
+  tier_pick "$1" "$2"
+  T_SRC="tier table"; T_OWNER=""
+  case "$1" in
+    worker|teammate|reproducer) if tier_match plan "$(tier_stage "$2")"; then mk="Plan model"; else mk=Model; ek=Effort; fi ;;
+    codex-reviewer) ek="Review effort" ;;
+  esac
+  if [ -n "$mk" ]; then
+    w=$(tier_word model "$(owner_value "$TIER_RD" "$mk" 1)"); v=ticket
+    [ -n "$w" ] || { w=$(tier_word model "$(owner_value "$TIER_PROJ" "$mk" 0)"); v=project; }
+    [ -z "$w" ] || { T_MODEL=$w; T_OWNER=$w; from="$from $v"; }
+  fi
+  if [ -n "$ek" ]; then
+    w=$(tier_word effort "$(owner_value "$TIER_RD" "$ek" 1)"); v=ticket
+    [ -n "$w" ] || { w=$(tier_word effort "$(owner_value "$TIER_PROJ" "$ek" 0)"); v=project; }
+    [ -z "$w" ] || { T_EFFORT=$w; from="$from $v"; }
+  fi
+  case "$from" in *ticket*) T_SRC="ticket line" ;; *project*) T_SRC="project line" ;; esac
+  return 0
+}
+cmd_run_options() {
+  [ "${1:-}" = --table ] && { tier_table; return 0; }
+  [ $# -ge 3 ] || die "usage: sa run-options <ticket-dir | tickets-dir> <role> \"<stage or mode>\""
+  [ -d "$1" ] || die "no such ticket or tickets folder: $1"
+  tier_files "$1" || die "neither a ticket folder (rd.md) nor a tickets folder (PROJECT.md, BOARD.md): $1"
+  tier_resolve "$(role_key "$2")" "$3"
+  echo "model $T_MODEL, effort $T_EFFORT ($T_SRC)"
+}
+tier_session_old() { # 0 when the Claude Code process running this hook started before agents/router.md last changed
+  # Such a router still follows the router.md it loaded at its start (a resumed session loads it again, so the
+  # process start is the test, not the transcript). The older prompt cannot follow this table: it calls a second
+  # review `review`, and writes plans inside a research start. Its starts are logged as before and never refused;
+  # the check begins with the router's next start. SA_TIER_SESSION=old|new overrides (tests).
+  case "${SA_TIER_SESSION:-}" in old) return 0 ;; new) return 1 ;; esac
+  local pid=$PPID n=0 line args et secs started changed
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$n" -lt 8 ]; do
+    args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
+    case "$args" in
+      claude|claude\ *|*/claude|*/claude\ *|*/claude/versions/*)
+        et=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
+        secs=$(printf '%s\n' "$et" | awk -F'[-:]' '{ if (NF == 4) print $1 * 86400 + $2 * 3600 + $3 * 60 + $4; else if (NF == 3) print $1 * 3600 + $2 * 60 + $3; else if (NF == 2) print $1 * 60 + $2 }')
+        [ -n "$secs" ] || return 1
+        started=$(( $(date +%s) - secs ))
+        changed=$(perl -e 'my @s = stat($ARGV[0]) or exit 1; print $s[9]' "$SA_DIR/../agents/router.md" 2>/dev/null) || return 1
+        [ -n "$changed" ] && [ "$started" -lt "$changed" ]; return $? ;;
+    esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); n=$((n + 1))
+  done
+  return 1   # no Claude Code process above this hook: judge it
+}
+tier_refusal() { # tier_refusal <role> <brief's folder> <brief's stage> <requested model>: the refusal line, or nothing
+  local role=$1 dir=$2 stage=$3 asked allowed roles key model max effort text more=""
+  [ "${SA_TIER:-}" = off ] && return 0
+  case "$role" in ""|*[!a-z-]*) return 0 ;; esac
+  [ -f "$SA_DIR/../agents/$role.md" ] || return 0   # a superagent role only
+  if [ -n "$4" ]; then asked=$(tier_word model "$4"); else asked=$(tier_word model "$(role_default "$role" model)"); fi
+  [ -n "$asked" ] || return 0   # an unknown model is not judged
+  case "$dir" in /*) tier_files "$dir" || { TIER_RD=""; TIER_PROJ=""; } ;; *) TIER_RD=""; TIER_PROJ="" ;; esac
+  tier_resolve "$role" "$stage"
+  allowed=$T_MAX
+  [ -z "$T_OWNER" ] || [ "$(tier_rank "$T_OWNER")" -le "$(tier_rank "$allowed")" ] || allowed=$T_OWNER
+  [ "$(tier_rank "$asked")" -le "$(tier_rank "$allowed")" ] && return 0
+  stage=$(oneline "$stage")
+  if [ -n "${stage//[[:space:]]/}" ]; then
+    echo "refused: $role at stage \"$stage\" runs on $allowed at most (asked: $asked). $TIER_RULE Start it again with model: $allowed."
+    return 0
+  fi
+  # no Stage: line: does some stage of this role allow the model asked for? (rows after the role's "any" row never apply)
+  while IFS='|' read -r roles key model max effort text; do
+    [ "$roles" = '*' ] || case ",$roles," in *",$role,"*) ;; *) continue ;; esac
+    [ "$(tier_rank "$max")" -ge "$(tier_rank "$asked")" ] && { more=1; break; }
+    [ "$key" = any ] && break
+  done <<< "$TIER_ROWS"
+  if [ -n "$more" ]; then
+    echo "refused: $role has no Stage: line in its brief, and runs on $allowed at most without one (asked: $asked). $TIER_RULE Add the line \"Stage: <stage>\" to the brief, or start it again with model: $allowed."
+  else
+    echo "refused: $role runs on $allowed at most (asked: $asked). $TIER_RULE Start it again with model: $allowed."
+  fi
+}
+
+# --- sa protocol <role>: the parts of PROTOCOL.md a role needs ----------------------------------------------------
+# Relies only on the "## N." headings and the bullet "- **Decision room**" of section 1, which splits it into its
+# basics (1b) and its room part (1r). Lines before "## 1." are always printed.
+cmd_protocol() {
+  [ $# -ge 1 ] || die "usage: sa protocol <role>"
+  local role parts label p="$SA_DIR/PROTOCOL.md"
+  [ -f "$p" ] || die "no PROTOCOL.md next to sa: $p"
+  role=$(role_key "$1")
+  case "$role" in
+    decision-room) parts="1b 1r 8" ;;
+    worker|teammate|reproducer) parts="1b 2 3 4 5 6 7 8 9" ;;
+    tester|codex-reviewer|merger|checker) parts="1b 2 3 4 5 6 7 8" ;;
+    watchdog|follow-up) parts="1b 2 3 7 8" ;;
+    *) parts=all ;;   # ticket-writer, clerk, router and any other role
+  esac
+  if [ "$parts" = all ]; then label="the whole file"
+  else label="sections $(printf '%s' "$parts" | sed 's/ /, /g; s/1b/1 (basics)/; s/1r/1 (decision room)/')"; fi
+  printf '# Superagent protocol for %s: %s. The whole file: %s\n' "$(oneline "$1")" "$label" "$p"
+  awk -v want=" $parts " '
+    /^## [0-9]+\./ { sec = $2; sub(/\.$/, "", sec); part = (sec == "1") ? "1b" : sec }
+    sec == "1" && index($0, "- **Decision room**") == 1 { part = "1r" }
+    want == " all " || part == "" || index(want, " " part " ") { print }' "$p"
+}
+
+# --- sa digest <ticket-dir>: <room>/<project>/digest/NNN.md ---------------------------------------------------------
+# A small cache that agents and the router read first instead of opening the notes. It lives in the room folder,
+# beside the log it is built from, never in the ticket folder: recording a decision or logging a line changes no
+# ticket. It is NOT evidence and NOT activity for anyone: no gate, review or stall check may read it as either. sa rebuilds it quietly after each
+# room-log line of its ticket; the Built: line names the log's size, so a reader whose log is longer knows it is old.
+DIGEST_LINES=12
+digest_build() { # digest_build <ticket-dir>: writes <room>/<project>/digest/NNN.md and prints its path; 1 with no room or on a failed write
+  ticket_vars "$1"
+  room_find
+  [ -n "$ROOM_LOG" ] || return 1
+  local ref title st size q f out tmp ROOM_CTX_WIDTH=200   # shorter lines: the digest stays near 3 KB
+  ref=$(room_ref)
+  title=$(head -1 "$RD" | sed -E 's/^#+[[:space:]]*//; s/^[0-9]{3}:[[:space:]]*//')
+  st=$(board_get); [ -n "$st" ] || st="-|-"
+  size=$(log_size) || size=unknown
+  out="$(dirname "$ROOM_LOG")/digest"
+  mkdir -p "$out" 2>/dev/null || return 1
+  out="$out/$ID.md"; tmp="$out.sa.$$"
+  if ! {
+    printf '# Digest: %s %s\n' "$ref" "$(oneline "$title")"
+    printf 'Built: %s from %s at %s bytes\n' "$(now)" "$ROOM_LOG" "$size"
+    printf 'Status: %s | Stage: %s\n' "${st%%|*}" "${st##*|}"
+    printf 'A cache written by `sa digest`: not evidence, not activity. When the log is longer than the size above, read the log.\n'
+    room_ctx_lines "$ROOM_LOG" "$ref" "Last log lines of $ref" "$DIGEST_LINES"
+    room_set_decisions "$(dirname "$ROOM_LOG")/DECISIONS.md" "$ref" "" "Decisions on $ref"
+    q=$(room_ctx_questions "$TDIR")
+    printf '\n## Open questions on %s\n%s\n' "$ref" "${q:-none}"
+    printf "\n## Files of this ticket, in %s\n" "$TDIR"
+    for f in "$TDIR"/*.md "$NOTES"/*.md; do
+      [ -f "$f" ] && [ "$f" != "$out" ] && printf -- "- %s (%s bytes)\n" "${f#"$TDIR"/}" "$(fsize "$f")"
+    done
+    :   # the status is the redirect's: a file that cannot be written fails, a skipped file does not
+  } > "$tmp" 2>/dev/null || ! replace_file "$tmp" "$out" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  printf '%s\n' "$out"
+}
+digest_refresh() { # after a room-log line of a ticket: rebuild its digest in a subshell; never fails, writes no log line
+  [ "${SA_NO_DIGEST:-}" = 1 ] && return 0
+  [ -n "${ROOM_TID:-}" ] && [ -n "${TICKETS:-}" ] || return 0
+  local d
+  for d in "$TICKETS/$ROOM_TID"-*; do
+    [ -f "$d/rd.md" ] || continue
+    ( digest_build "$d" ) >/dev/null 2>&1
+    break
+  done
+  return 0
+}
+cmd_digest() {
+  [ $# -ge 1 ] || die "usage: sa digest <ticket-dir>"
+  ticket_vars "$1"
+  room_find
+  [ -n "$ROOM_LOG" ] || { echo "no decision room for this project; no digest written"; return 0; }
+  digest_build "$1" || die "could not write $(dirname "$ROOM_LOG")/digest/$ID.md"
+}
+
+# --- sa cleanup <ticket-dir> [--dry-run]: the worktrees and branches of a done ticket ---------------------------
+# Deletes, so every condition is checked first: the ticket is done; a candidate is a worktree of the repo holding the
+# tickets folder named <NNN>-<slug> or <NNN>-<slug>-<part> (never the main checkout), whose branch is merged into the
+# base (PROJECT.md's Base branch:) and which has no uncommitted change. Never --force, never branch -D.
+cmd_cleanup() {
+  [ $# -ge 1 ] || die "usage: sa cleanup <ticket-dir> [--dry-run]"
+  local dry=0 st repo base main merged path branch out found=0
+  [ "${2:-}" = --dry-run ] && dry=1
+  ROLE_OWN=merger
+  ticket_vars "$1"
+  st=$(board_get); st=${st%%|*}
+  [ "$st" = done ] || die "$ID is '${st:-not on the board}', not done; only a done ticket is cleaned up"
+  # the owner's choice per project: removal also deletes the working copy's ignored files (a local .env, node_modules)
+  grep -qiE '^Cleanup:[[:space:]]*auto([[:space:]]|$)' "$TICKETS/PROJECT.md" 2>/dev/null ||
+    die "PROJECT.md does not say 'Cleanup: auto'; in this project the user is asked before a working copy is removed"
+  repo=$(git -C "$TICKETS" rev-parse --show-toplevel 2>/dev/null) || die "the tickets folder is not in a git checkout: $TICKETS"
+  base=$(sed -n 's/^Base branch:[[:space:]]*//p' "$TICKETS/PROJECT.md" 2>/dev/null | head -1 | awk '{ print $1 }')
+  [ -n "$base" ] || die "PROJECT.md has no 'Base branch:' line"
+  git -C "$repo" rev-parse --verify -q "$base^{commit}" >/dev/null || die "no such base '$base' in $repo"
+  [ "$dry" = 1 ] || lock "$TICKETS"
+  merged=$(git -C "$repo" branch --merged "$base" --format='%(refname:short)')
+  main=$(git -C "$repo" worktree list --porcelain | sed -n '1s/^worktree //p')
+  while IFS=$'\t' read -r path branch; do
+    [ -n "$path" ] && [ "$path" != "$main" ] && [ "$path" != "$repo" ] || continue
+    case "$(basename "$path")" in "$ID-$SLUG"|"$ID-$SLUG"-*) ;; *) continue ;; esac
+    found=1
+    if [ -z "$branch" ]; then echo "kept $path: no branch (detached HEAD)"; continue; fi
+    if [ "$branch" = "$base" ]; then echo "kept $path: it has the base branch $base checked out"; continue; fi
+    if ! printf '%s\n' "$merged" | grep -qxF -- "$branch"; then echo "kept $path: branch $branch is not merged into $base"; continue; fi
+    if [ ! -d "$path" ]; then echo "kept $path: the folder is missing (git worktree prune clears it)"; continue; fi
+    if [ -n "$(wt_changes "$path")" ]; then echo "kept $path: uncommitted changes (sa dirty $path)"; continue; fi
+    if [ "$dry" = 1 ]; then echo "would remove $path and branch $branch"; continue; fi
+    if ! out=$(git -C "$repo" worktree remove "$path" 2>&1); then echo "kept $path: git refused: $(oneline "$out" | cut -c1-200)"; continue; fi
+    if out=$(git -C "$repo" branch -d "$branch" 2>&1); then
+      echo "removed $path and branch $branch"
+    else
+      echo "removed $path; kept branch $branch: git refused: $(oneline "$out" | cut -c1-200)"; branch="$branch (kept)"
+    fi
+    { mkdir -p "$NOTES" && own_line "$NOTES/delete-list.md" && printf -- '- %s: %s, branch %s\n' "$(today)" "$path" "$branch" >> "$NOTES/delete-list.md"; } 2>/dev/null ||
+      echo "note: could not write notes/delete-list.md"
+    room_log note "cleanup: removed $path, branch $branch"
+  done < <(git -C "$repo" worktree list --porcelain | awk '
+    /^worktree / { if (w != "") print w "\t" b; w = substr($0, 10); b = "" }
+    /^branch refs\/heads\// { b = substr($0, 19) }
+    END { if (w != "") print w "\t" b }')
+  [ "$found" = 1 ] || echo "nothing to clean"
+  return 0
+}
+
+cmd_room() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    note) room_note "$@" ;;
+    event) room_event "$@" ;;
+    index) room_index "$@" ;;
+    context) room_context "$@" ;;
+    decide) room_decide "$@" ;;
+    on) room_on "$@" ;;
+    off) room_off "$@" ;;
+    status) room_status "$@" ;;
+    owner) room_owner "$@" ;;
+    pr-ok) room_pr_ok "$@" ;;
+    watch) room_watch "$@" ;;
+    # never fails the tool call and never prints a decision, except a start above the tier: exit 2 blocks it (room_hook)
+    hook) { room_hook "$@"; } 2>&1 | { head -1 >&2; cat >/dev/null; }; [ "${PIPESTATUS[0]}" = 2 ] && exit 2; exit 0 ;;
+    seat) exec bash "$SA_DIR/seat.sh" "$@" ;;
+    *) die "usage: sa room note|event|index|decide|on|off|status|owner|pr-ok|watch|hook|seat ... (sa help)" ;;
+  esac
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  stage) cmd_stage "$@" ;;
+  ask) cmd_ask "$@" ;;
+  answer) cmd_answer "$@" ;;
+  suggest) cmd_suggest "$@" ;;
+  suggest-close) cmd_suggest_close "$@" ;;
+  learn) cmd_learn "$@" ;;
+  qa) cmd_qa "$@" ;;
+  qa-pass) cmd_qa_pass "$@" ;;
+  fresh) cmd_fresh "$@" ;;
+  dirty) cmd_dirty "$@" ;;
+  selfcheck) cmd_selfcheck "$@" ;;
+  gate) cmd_gate "$@" ;;
+  land) cmd_land "$@" ;;
+  room) cmd_room "$@" ;;
+  stats) command -v python3 >/dev/null || die "sa stats needs python3"; exec python3 -I "$SA_DIR/stats.py" "$@" ;;
+  queue|sweep) command -v python3 >/dev/null || die "sa $cmd needs python3"; exec python3 -I "$SA_DIR/flow.py" "$cmd" "$@" ;;
+  run-options) cmd_run_options "$@" ;;
+  protocol) cmd_protocol "$@" ;;
+  digest) cmd_digest "$@" ;;
+  cleanup) cmd_cleanup "$@" ;;
+  ""|help|-h|--help) awk 'NR == 1 { next } !/^#/ { exit } { print }' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$cmd'. Run: sa help" ;;
+esac

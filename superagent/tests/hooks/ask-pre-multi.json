@@ -1,0 +1,36 @@
+{
+   "agent_type" : "router",
+   "cwd" : "@F@",
+   "effort" : {
+      "level" : "medium"
+   },
+   "hook_event_name" : "PreToolUse",
+   "permission_mode" : "auto",
+   "prompt_id" : "130d998f-90ce-4f36-a6a5-0dd891987c2d",
+   "session_id" : "053c7396-d477-4bdd-be6d-bd1f9a3ee545",
+   "tool_input" : {
+      "questions" : [
+         {
+            "header" : "Checks",
+            "multiSelect" : true,
+            "options" : [
+               {
+                  "description" : "u",
+                  "label" : "Unit"
+               },
+               {
+                  "description" : "l",
+                  "label" : "Lint"
+               },
+               {
+                  "description" : "e",
+                  "label" : "E2E"
+               }
+            ],
+            "question" : "Which checks should run?"
+         }
+      ]
+   },
+   "tool_name" : "AskUserQuestion",
+   "tool_use_id" : "toolu_01LboHWUUqeAHsy1jnCZvMod"
+}

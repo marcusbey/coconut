@@ -1,0 +1,29 @@
+[38;5;33m🧭 router[0m  [38;5;97m🏛️ decision-room[0m  [38;5;103m✍️ clerk[0m  [38;5;172m🔨 worker[0m  [38;5;137m🤝 teammate[0m  [38;5;100m🐞 reproducer[0m  [38;5;29m🧪 tester[0m  [38;5;37m🔍 reviewer[0m  [38;5;63m🔀 merger[0m  [38;5;74m🌐 checker[0m  [38;5;66m🐶 watchdog[0m  [38;5;141m👤 user[0m  ❔ unknown
+[1;38;5;244m──── demo ──────────────────────────────────────────────────[0m
+[2m2026-11-13 09:12[0m | [1mdemo#001[0m | stage | ready/- -> in-progress/build: worker starts
+🔨 [2m2026-11-14 09:00[0m | [1mdemo#001[0m | [38;5;172mdispatch | worker: started by router: stage build, model sonnet, effort max[0m
+🔨 [2m2026-11-14 09:01[0m | [1mdemo#001[0m | [38;5;172mstage | ready/- -> in-progress/build: tests first[0m
+🔨 [2m2026-11-14 09:05[0m | [1mdemo#001[0m | [38;5;172mnote | worker: baseline is 217 ok, 0 FAIL[0m
+🧪 [2m2026-11-14 09:10[0m | [1mdemo#001[0m | [38;5;29mnote | tester: round 1 starts[0m
+🧪 [2m2026-11-14 09:20[0m | [1mdemo#001[0m | [31mreport | tester: failed: one check fails[0m
+🔨 [2m2026-11-14 09:21[0m | [1mdemo#001[0m | [31mstage | in-progress/build -> blocked/build: waits for an answer[0m
+🔨 [2m2026-11-14 09:21[0m | [1mdemo#001[0m | [38;5;172mquestion | in-progress/build -> blocked/build: Q1 from worker: Use A or B? | options: (a) use A (recommended); (b) use B[0m
+👤 [2m2026-11-14 09:22[0m | [1mdemo#001[0m | [38;5;141manswer | Q1 answered by the user: use A | question: Use A or B?[0m
+🏛️ [2m2026-11-14 09:23[0m | [1mdemo#001[0m | [1;35mdecision | D1 (Q1): Use A or B? -> (a) use A; decided by both[0m
+🔨 [2m2026-11-14 09:25[0m | [1mdemo#001[0m | [31mstage | blocked/build -> failed/build: the build broke[0m
+[2m· · ·[0m
+🔍 [2m2026-11-14 09:30[0m | [1mdemo#002[0m | [31mreport | codex-reviewer: refused: nothing to review[0m
+[1;38;5;244m──── group/app ─────────────────────────────────────────────[0m
+🧭 [2m2026-11-14 09:40[0m | [1mgroup/app#001[0m | [38;5;33mnote | router: briefing the teammate[0m
+🤝 [2m2026-11-14 09:41[0m | [1mgroup/app#001[0m | [38;5;137mnote | teammate: contract written[0m
+[2m· · ·[0m
+✍️ [2m2026-11-14 09:45[0m | [1mgroup/app[0m | [38;5;103msuggestion | S1 from group/app#001 clerk: add a retry[0m
+[1;38;5;244m──── demo ──────────────────────────────────────────────────[0m
+🔀 [2m2026-11-14 09:50[0m | [1mdemo#002[0m | [1;32mlanding | 3f2a1bc on main[0m
+[1;38;5;244m──── group/app ─────────────────────────────────────────────[0m
+🔀 [2m2026-11-14 09:50[0m | [1mgroup/app#001[0m | [38;5;63mnote | merger: the same minute as the demo landing[0m
+[1;38;5;244m──── demo ──────────────────────────────────────────────────[0m
+❔ [2m2026-11-14 09:51[0m | [1mdemo#002[0m | note | stranger: a line with no known role
+🔨 [2m2026-11-14 09:52[0m | [1mdemo#002[0m | [38;5;172mnote | worker: [31mredafter tab[0m
+[1;38;5;244m──── group/app ─────────────────────────────────────────────[0m
+🐶 [2m2026-11-14 09:53[0m | [1mgroup/app[0m | [38;5;66mreport | watchdog: waiting: router: ticket 002 is stuck[0m

@@ -1,0 +1,58 @@
+{
+   "agent_type" : "router",
+   "cwd" : "@F@",
+   "duration_ms" : 0,
+   "effort" : {
+      "level" : "medium"
+   },
+   "hook_event_name" : "PostToolUse",
+   "permission_mode" : "auto",
+   "prompt_id" : "9257d350-0af8-4681-9b0f-6906c35b6644",
+   "session_id" : "fc6b851f-ae1a-4f37-8ed7-ba39ed372180",
+   "tool_input" : {
+      "answers" : {
+         "demo#001 Demo ticket: approve the plan?" : "Approve (Recommended)"
+      },
+      "questions" : [
+         {
+            "header" : "Plan",
+            "multiSelect" : false,
+            "options" : [
+               {
+                  "description" : "go",
+                  "label" : "Approve (Recommended)"
+               },
+               {
+                  "description" : "edit",
+                  "label" : "Change it"
+               }
+            ],
+            "question" : "demo#001 Demo ticket: approve the plan?"
+         }
+      ]
+   },
+   "tool_name" : "AskUserQuestion",
+   "tool_response" : {
+      "answers" : {
+         "demo#001 Demo ticket: approve the plan?" : "Approve (Recommended)"
+      },
+      "questions" : [
+         {
+            "header" : "Plan",
+            "multiSelect" : false,
+            "options" : [
+               {
+                  "description" : "go",
+                  "label" : "Approve (Recommended)"
+               },
+               {
+                  "description" : "edit",
+                  "label" : "Change it"
+               }
+            ],
+            "question" : "demo#001 Demo ticket: approve the plan?"
+         }
+      ]
+   },
+   "tool_use_id" : "toolu_016efguypTmNmeQGxNSkc22y"
+}

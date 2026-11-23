@@ -1,0 +1,58 @@
+{
+   "agent_type" : "router",
+   "cwd" : "@F@",
+   "duration_ms" : 1,
+   "effort" : {
+      "level" : "medium"
+   },
+   "hook_event_name" : "PostToolUse",
+   "permission_mode" : "auto",
+   "prompt_id" : "4bb27fea-2d72-4615-97ad-4813fbbfb75e",
+   "session_id" : "64d5e084-0fea-4642-80ab-f992e7b1672d",
+   "tool_input" : {
+      "answers" : {
+         "app#001 Demo ticket: merge it?" : "merge it, but \"only\" after 007 | not before"
+      },
+      "questions" : [
+         {
+            "header" : "Merge",
+            "multiSelect" : false,
+            "options" : [
+               {
+                  "description" : "land it",
+                  "label" : "Merge (Recommended)"
+               },
+               {
+                  "description" : "wait",
+                  "label" : "Not yet"
+               }
+            ],
+            "question" : "app#001 Demo ticket: merge it?"
+         }
+      ]
+   },
+   "tool_name" : "AskUserQuestion",
+   "tool_response" : {
+      "answers" : {
+         "app#001 Demo ticket: merge it?" : "merge it, but \"only\" after 007 | not before"
+      },
+      "questions" : [
+         {
+            "header" : "Merge",
+            "multiSelect" : false,
+            "options" : [
+               {
+                  "description" : "land it",
+                  "label" : "Merge (Recommended)"
+               },
+               {
+                  "description" : "wait",
+                  "label" : "Not yet"
+               }
+            ],
+            "question" : "app#001 Demo ticket: merge it?"
+         }
+      ]
+   },
+   "tool_use_id" : "toolu_012mdjEoRALt1CfMtQdcMiRb"
+}

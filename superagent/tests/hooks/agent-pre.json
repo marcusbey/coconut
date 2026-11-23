@@ -1,0 +1,20 @@
+{
+   "agent_type" : "router",
+   "cwd" : "@F@",
+   "effort" : {
+      "level" : "medium"
+   },
+   "hook_event_name" : "PreToolUse",
+   "permission_mode" : "auto",
+   "prompt_id" : "a4621117-0b28-4ed8-bcb1-672bad314e32",
+   "session_id" : "e5ae8e19-c0b8-4a8f-b37a-13dc1fae8cef",
+   "tool_input" : {
+      "description" : "probe",
+      "effort" : "low",
+      "model" : "haiku",
+      "prompt" : "Ticket folder: /x/tickets/001-a\nStage: test\nReply done.",
+      "subagent_type" : "echoer"
+   },
+   "tool_name" : "Agent",
+   "tool_use_id" : "toolu_01JxRqvtM4ZNXYtk5JNw5XPS"
+}

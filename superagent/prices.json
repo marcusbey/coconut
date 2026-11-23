@@ -1,0 +1,10 @@
+{
+  "source": "https://platform.claude.com/docs/en/about-claude/pricing (model pricing table), read 2026-11-22. USD per million tokens. cache_write is the 5-minute write price (1h writes cost more: fable 16, opus 8, sonnet 4, haiku 0.20); cache_read is 'cache hits and refreshes'. Haiku 5.5 is priced per request by prompt size: 'long' applies when input + cache write + cache read exceeds 100000 tokens. Standard speed, global routing, no batch discount.",
+  "models": {
+    "fable":  {"input": 8,    "output": 40,  "cache_write": 10,    "cache_read": 0.20},
+    "opus":   {"input": 4,    "output": 20,  "cache_write": 5,     "cache_read": 0.20},
+    "sonnet": {"input": 2,    "output": 10,  "cache_write": 2.5,   "cache_read": 0.10},
+    "haiku":  {"input": 0.10, "output": 0.5, "cache_write": 0.125, "cache_read": 0.01,
+               "long": {"input": 0.5, "output": 2.5, "cache_write": 0.625, "cache_read": 0.05}}
+  }
+}
