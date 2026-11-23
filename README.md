@@ -7,7 +7,7 @@ A **decision room** of several models can answer the questions you would otherwi
 ## Install
 
 ```bash
-git clone <this repository> coconut && cd coconut
+git clone https://github.com/marcusbey/coconut.git && cd coconut
 ./install.sh --workspace ~/code      # ~/code: the folder that holds your project repositories
 ```
 
