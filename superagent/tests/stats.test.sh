@@ -48,7 +48,8 @@ c_spend() { # weights: cache write 1.25, cache read 0.1, output 5; a repeated me
 c_stage() { # builders split by the brief's Stage line (first word, lower case); first = context of the first turn; cache = read share
   local out now
   now=$(python3 -I -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"))')
-  printf '{"agentType":"worker"}\n' > "$RUNS/agent-p1.meta.json"; printf '{"agentType":"worker"}\n' > "$RUNS/agent-p2.meta.json"
+  # p2 is a named agent, as the router starts them now: its role comes from spawnedAgentType, not from its name
+  printf '{"agentType":"worker"}\n' > "$RUNS/agent-p1.meta.json"; printf '{"agentType":"dario-demo-001","name":"dario-demo-001","spawnedAgentType":"worker","customAgentType":"worker"}\n' > "$RUNS/agent-p2.meta.json"
   printf '{"agentType":"router"}\n' > "$RUNS/agent-p3.meta.json"
   brief "$RUNS/agent-p1.jsonl" 'demo#001 start\nStage: Plan extra words\nRun: model opus'
   turn "$RUNS/agent-p1.jsonl" p1 claude-sonnet-5-5 "$now" 10 3000 7000 0
