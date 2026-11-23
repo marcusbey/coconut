@@ -61,7 +61,7 @@ A ticket's `Kind` (ship | scout), `Track` (quick | full) and optional `Type: bug
 | `plan-review` | | ✓ | | codex-reviewer, plan mode | `notes/plan-review.md` ending `Plan sound: yes\|no` | sound, or 2 rounds done |
 | `approve-plan` | | ✓ | | the user, asked by the router; with the decision room on, the room, carried out by the clerk | `Approved:` line in `notes/plan.md` | the user approves |
 | `build` | ✓ | ✓ | | builder | commits on the ticket branch, `notes/results.md` | builder reports `ready` |
-| `report` | | | ✓ | builder | `notes/report.md` | written; the ticket is then `done` |
+| `report` | | | ✓ | builder | `notes/scout.md` | written; the ticket is then `done` |
 | `test` | ✓ | ✓ | | tester | `notes/test.md` with `Tested commit:` and `Result:` | `Result: pass` |
 | `review` | ✓ | ✓ | | codex-reviewer | `notes/review.md` with `Reviewed commit:` and `Ship allowed:` | `Ship allowed: yes` |
 | `approve-merge` | ✓ | ✓ | | the user, asked by the router; with the decision room on, the room, carried out by the clerk | | the user approves (skipped when PROJECT.md allows an automatic merge) |
