@@ -151,13 +151,25 @@ c_review_on_fable_refused() {
   refused "$D/q.json" 'codex-reviewer at stage "plan-review" runs on opus at most (asked: fable)'
 }
 c_label_logged() {
-  agent "$D/p.json" worker "Ticket folder: $T"$'\nStage: build' 'tool_input.model="sonnet"' 'tool_input.description="Andrea > demo > 001 build"'
+  agent "$D/p.json" worker "Ticket folder: $T"$'\nStage: build' 'tool_input.model="sonnet"' 'tool_input.name="Andrea-demo-001"' 'tool_input.description="build: the demo task"'
   passes "$D/p.json"
-  grep -v '^# ' "$LOG" | tail -1 | grep -qF 'effort low, as Andrea > demo > 001 build' || fail "no label: $(cat "$LOG")"
+  grep -v '^# ' "$LOG" | tail -1 | grep -qF 'effort low, as Andrea-demo-001: build: the demo task' || fail "no label: $(cat "$LOG")"
 }
 run_case "a role that is not a superagent role passes" c_other_role_passes
 run_case "a router older than router.md is logged, never refused" c_old_router_not_refused
 run_case "a review on opus passes, whatever its brief calls it" c_review_on_opus_passes
+c_review_model_line() {
+  # the owner's Review model: line covers the Claude review only; Model: never covers a review
+  awk '{ print } /^Status:/ && !d { print "Model: fable"; d = 1 }' "$T/rd.md" > "$D/rd" && cat "$D/rd" > "$T/rd.md"
+  agent "$D/p.json" codex-reviewer "Ticket folder: $T"$'\nStage: second-review' 'tool_input.model="fable"'
+  refused "$D/p.json" 'codex-reviewer at stage "second-review" runs on opus at most (asked: fable)'
+  awk '{ print } /^Status:/ && !d { print "Review model: fable"; d = 1 }' "$T/rd.md" > "$D/rd" && cat "$D/rd" > "$T/rd.md"
+  agent "$D/q.json" codex-reviewer "Ticket folder: $T"$'\nStage: second-review' 'tool_input.model="fable"' 'tool_use_id="t_q"'
+  hook "$D/q.json"; [ "$RC" = 0 ] || fail "Review model: fable must allow the second review: $RC $(cat "$D/hook.err")"
+  agent "$D/r.json" codex-reviewer "Ticket folder: $T"$'\nStage: review' 'tool_input.model="fable"' 'tool_use_id="t_r"'
+  hook "$D/r.json"; [ "$RC" = 2 ] || fail "the Codex wrapper must stay on the table: $RC"
+}
 run_case "a review on fable is refused" c_review_on_fable_refused
+run_case "Review model: fable allows the Claude review, and only that" c_review_model_line
 run_case "the agent's name and task are on its start line" c_label_logged
 run_case "a brief with no folder is judged on role and stage" c_no_folder

@@ -1709,7 +1709,7 @@ HOOK_PARSE='use JSON::PP; binmode(STDOUT, ":utf8"); local $/; my $d = eval { dec
       $g = $1 if $l =~ /^\s*Ticket folder:\s*(.*?)\s*$/;   # a ticket folder wins over a tickets folder
       $s = $1 if $s eq "" && $l =~ /^\s*Stage:\s*(.*?)\s*$/;
     }
-    print join("\0", "D", cl($i->{subagent_type}), cl($g ne "" ? $g : $f), cl($s), cl($i->{model}), cl($i->{effort}), cl($i->{description})), "\0";
+    print join("\0", "D", cl($i->{subagent_type}), cl($g ne "" ? $g : $f), cl($s), cl($i->{model}), cl($i->{effort}), cl($i->{description}), cl($i->{name})), "\0";
   } elsif ($o[1] eq "AskUserQuestion") {
     my $r = ref $d->{tool_response} eq "HASH" ? $d->{tool_response} : {};
     my $a = ref $r->{answers} eq "HASH" ? $r->{answers} : {};
@@ -1764,8 +1764,10 @@ hook_room() { # hook_room <folder of a brief>: sets TICKETS ROOM_TID ROOM_LOG RO
   [ -n "$ROOM_LOG" ]
 }
 hook_dispatch() { # hook_dispatch <session> <tool_use_id> <role> <folder> <stage> <model> <effort> <cwd> [<the Agent call's description>]
-  local sid=$1 tid=$2 role=$3 dir=$4 stage=$5 model=$6 effort=$7 cwd=$8 label=${9:-} ref ws
-  label=$(printf '%s' "$label" | cut -c1-120)   # the agent's name and task, as the router wrote them: "Andrea > my-app > 009 build"
+  local sid=$1 tid=$2 role=$3 dir=$4 stage=$5 model=$6 effort=$7 cwd=$8 label=${9:-} nick=${10:-} ref ws
+  # the agent's name and its task, as the router wrote them: "Andrea-my-app-009: build: permissions onboarding"
+  [ -z "$nick" ] || label="$nick${label:+: $label}"
+  label=$(printf '%s' "$label" | cut -c1-120)
   case "$role" in ""|*[!a-z-]*) return 0 ;; esac
   [ -f "$SA_DIR/../agents/$role.md" ] || return 0   # a superagent role only
   hook_room "$dir" || return 0
@@ -1908,7 +1910,7 @@ room_hook() { # room_hook pre|post < hook JSON
   mkdir -p "$st/seen" 2>/dev/null || return 0
   mkdir "$st/seen/$(hook_id "${x[4]}").$(hook_id "${x[5]}").$1" 2>/dev/null || return 0   # once per delivery
   case "${x[1]}" in
-    Agent) [ "${#x[@]}" -ge 13 ] && [ "${x[7]}" = D ] && hook_dispatch "${x[4]}" "${x[5]}" "${x[8]}" "${x[9]}" "${x[10]}" "${x[11]}" "${x[12]}" "${x[6]}" "${x[13]:-}" ;;
+    Agent) [ "${#x[@]}" -ge 13 ] && [ "${x[7]}" = D ] && hook_dispatch "${x[4]}" "${x[5]}" "${x[8]}" "${x[9]}" "${x[10]}" "${x[11]}" "${x[12]}" "${x[6]}" "${x[13]:-}" "${x[14]:-}" ;;
     AskUserQuestion) [ "${#x[@]}" -ge 10 ] && hook_questions "${x[6]}" "${x[@]:7}" ;;
   esac
   return 0
@@ -2149,7 +2151,7 @@ PERL
 # `sa run-options --table` prints it. The first row whose role and stage key match wins. Stage keys: plan (starts with
 # plan, not plan-review), scout (rd.md's header has Kind: scout or Risk: high), write, second, any, else a word the
 # stage contains. The stage is matched in lower case, because routers write it loosely.
-TIER_RULE='Tier rule of 2026-11-22: Fable 5.2 only for the decision room, ticket writing and the plan stage. A model the owner chose goes on the ticket first (a Model: or Plan model: line, written by the clerk).'
+TIER_RULE='Tier rule of 2026-11-22: Fable 5.2 only for the decision room, ticket writing and the plan stage. A model the owner chose goes on the ticket first (a Model:, Plan model: or Review model: line, written by the clerk).'
 TIER_ROWS='worker,teammate,reproducer|plan|fable|fable|medium|starts with `plan` (but not `plan-review` / `plan review`)
 worker,teammate,reproducer|design|opus|opus|high|`design`
 reproducer|any|opus|opus|medium|anything else
@@ -2220,7 +2222,9 @@ tier_resolve() { # tier_resolve <role> <stage>: the table's row, then the owner'
   T_SRC="tier table"; T_OWNER=""
   case "$1" in
     worker|teammate|reproducer) if tier_match plan "$(tier_stage "$2")"; then mk="Plan model"; else mk=Model; ek=Effort; fi ;;
-    codex-reviewer) ek="Review effort" ;;
+    # Review model: is the owner's choice for the Claude review (the second review, a Claude-alone review); the
+    # wrapper that only runs Codex stays on the table.
+    codex-reviewer) ek="Review effort"; case "$(printf '%s' "$2" | tr 'A-Z' 'a-z')" in *second*|*claude*) mk="Review model" ;; esac ;;
   esac
   if [ -n "$mk" ]; then
     w=$(tier_word model "$(owner_value "$TIER_RD" "$mk" 1)"); v=ticket

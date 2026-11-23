@@ -115,7 +115,7 @@ def spend(projects, workspace, since):
             if not turns:
                 continue
             fam = collections.Counter(f for f, _ in turns).most_common(1)[0][0]
-            # a named agent ("dario-hotmilk-056") carries its name in agentType; its role is in spawnedAgentType
+            # a named agent ("dario-clip-app-056") carries its name in agentType; its role is in spawnedAgentType
             name = meta.get("spawnedAgentType") or meta.get("customAgentType") or meta.get("agentType") or "?"
             key = ("%s@%s" % (name, stage_of(brief)) if name in BUILDERS else name, fam)
             roles[key]["runs"] += 1
